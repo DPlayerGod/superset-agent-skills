@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "superset-postgres": {
+      "command": "python3",
+      "args": ["/app/mcp_server.py"],
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}",
+        "MCP_MAX_ROWS": "${MCP_MAX_ROWS}",
+        "SUPERSET_URL": "${SUPERSET_URL}",
+        "SUPERSET_ADMIN_USERNAME": "${SUPERSET_ADMIN_USERNAME}",
+        "SUPERSET_ADMIN_PASSWORD": "${SUPERSET_ADMIN_PASSWORD}"
+      }
+    }
+  }
+}

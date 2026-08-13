@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: super_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: super_db
+      POSTGRES_USER: super_user
+      POSTGRES_PASSWORD: super_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+
+  superset:
+    build:
+      context: .
+      dockerfile: superset/Dockerfile
+    image: super_dplayergod-superset:6.1.0
+    container_name: super_superset
+    restart: always
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: "super_secret_key_987654321_abc"
+      AGENT_GATEWAY_URL: http://claude_gateway:8090
+    user: root
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Bootstrapping Apache Superset...' &&
+      pip install --no-cache-dir psycopg2-binary --target=/app/.venv/lib/python3.10/site-packages &&
+      superset db upgrade &&
+      superset fab create-admin --username admin --firstname Super --lastname Admin --email admin@super.com --password admin || true &&
+      superset init &&
+      /usr/bin/run-server.sh
+      "
+    volumes:
+      - superset_home:/app/superset_home
+
+  claude_gateway:
+    build:
+      context: .
+      dockerfile: claude_gateway/Dockerfile
+    image: super_dplayergod-claude-gateway:latest
+    container_name: super_claude_gateway
+    restart: always
+    depends_on:
+      - postgres
+      - superset
+    working_dir: /app
+    command: python3 gateway_server.py
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in your shell or a .env file before running docker compose up}
+      DATABASE_URL: postgresql://super_user:super_pass@postgres:5432/super_db
+      MCP_MAX_ROWS: 500
+      SUPERSET_URL: http://superset:8088
+      SUPERSET_ADMIN_USERNAME: admin
+      SUPERSET_ADMIN_PASSWORD: admin
+      CLAUDE_GATEWAY_PORT: 8090
+    volumes:
+      - claude_home:/home/node/.claude
+
+volumes:
+  postgres_data:
+  superset_home:
+  claude_home:

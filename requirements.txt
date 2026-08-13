@@ -1,0 +1,5 @@
+psycopg2-binary>=2.9.0
+sqlalchemy>=2.0.0
+pandas>=2.0.0
+mcp>=1.0.0,<2.0.0
+requests>=2.31.0

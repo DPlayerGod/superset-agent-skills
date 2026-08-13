@@ -1,0 +1,1 @@
+docker exec super_postgres psql -U super_user -d super_db -c "SELECT COUNT(*) FROM fact_employee_allocation;"

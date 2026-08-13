@@ -1,0 +1,18 @@
+#vdt-ai-chat-root { position: fixed; z-index: 2000; right: 24px; bottom: 24px; font-family: Inter, Arial, sans-serif; color: #e8edf5; }
+#vdt-ai-chat-root * { box-sizing: border-box; }
+.vdt-ai-button { border: 0; border-radius: 24px; padding: 12px 17px; background: #1677ff; color: white; font-weight: 700; cursor: pointer; box-shadow: 0 8px 24px #0004; }
+.vdt-ai-panel { display: none; position: absolute; right: 0; bottom: 52px; width: min(430px, calc(100vw - 32px)); height: min(640px, calc(100vh - 120px)); background: #101828; border: 1px solid #334155; border-radius: 14px; box-shadow: 0 18px 60px #0009; overflow: hidden; flex-direction: column; }
+.vdt-ai-panel.open { display: flex; }
+.vdt-ai-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; background: #172033; border-bottom: 1px solid #334155; font-weight: 700; }
+.vdt-ai-header button, .vdt-ai-copy { background: transparent; border: 0; color: #b8c4d8; cursor: pointer; }
+.vdt-ai-history { flex: 1; overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.vdt-ai-message { padding: 10px 12px; border-radius: 10px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.vdt-ai-user { align-self: flex-end; max-width: 88%; background: #1d4ed8; }
+.vdt-ai-agent { background: #1e293b; }
+.vdt-ai-agent pre { margin: 10px 0 0; padding: 10px; overflow: auto; border-radius: 7px; background: #020617; color: #b5d9ff; font-size: 12px; }
+.vdt-ai-table { display: block; max-width: 100%; overflow: auto; margin-top: 10px; border-collapse: collapse; font-size: 12px; }
+.vdt-ai-table th, .vdt-ai-table td { padding: 6px 8px; border: 1px solid #475569; text-align: left; white-space: nowrap; }
+.vdt-ai-input { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #334155; }
+.vdt-ai-input textarea { flex: 1; min-height: 42px; resize: none; padding: 10px; color: #eef2ff; background: #0f172a; border: 1px solid #475569; border-radius: 8px; }
+.vdt-ai-input button { border: 0; border-radius: 8px; padding: 0 14px; background: #1677ff; color: white; cursor: pointer; }
+.vdt-ai-muted { color: #b8c4d8; font-size: 12px; }
