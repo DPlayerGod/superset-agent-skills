@@ -52,6 +52,7 @@ services:
     command: python3 gateway_server.py
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in your shell or a .env file before running docker compose up}
+      ANTHROPIC_BASE_URL: https://1gw.gwai.cloud
       DATABASE_URL: postgresql://super_user:super_pass@postgres:5432/super_db
       MCP_MAX_ROWS: 500
       SUPERSET_URL: http://superset:8088
