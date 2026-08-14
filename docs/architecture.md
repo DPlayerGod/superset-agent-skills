@@ -281,8 +281,9 @@ thiết kế.
 chừng** — vì `--resume` sẽ nối tiếp một transcript mà model đã nhớ, đổi tool/prompt
 giữa chừng thì kết quả không còn giải thích được.
 
-Nút **So sánh** chạy song song cả 2 variant, mỗi bên một `session_id` dùng một
-lần rồi bỏ, và **chỉ hiển thị chứ không lưu** vào thread.
+Muốn đối chiếu 2 variant thì tạo 2 thread — mỗi thread một variant — rồi hỏi
+cùng một câu. Nút **So sánh** (chạy song song cả 2 variant trong một lượt) đã bị
+gỡ khỏi UI.
 
 ### 4.3 Hai URL Superset — đừng nhầm
 

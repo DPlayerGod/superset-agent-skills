@@ -5,6 +5,14 @@
   const maxThreads = 20;
   const maxMessages = 60;
   const variants = ['baseline', 'skills'];
+  // Starter questions for an empty thread. Each one leans on a different column of
+  // fact_employee_allocation so the answers show off a different tool path.
+  const suggestions = [
+    'Tổng FTE theo từng dự án trong quý này',
+    'Top 10 nhân sự có FTE cao nhất tháng gần nhất',
+    'Vẽ biểu đồ FTE theo tháng của từng đơn vị',
+    'Nhân sự nào đang tham gia nhiều dự án nhất?',
+  ];
   const escapeHtml = text => String(text).replace(/[&<>]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[char]));
   const newId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
@@ -84,7 +92,7 @@
 
     const root = document.createElement('section');
     root.id = 'vdt-ai-chat-root';
-    root.innerHTML = `<div class="vdt-ai-panel" aria-label="AI Agent"><div class="vdt-ai-header"><span class="vdt-ai-title">AI Data Agent</span><span class="vdt-ai-actions"><button class="vdt-ai-new" title="Đoạn chat mới">+</button><button class="vdt-ai-threads" title="Lịch sử đoạn chat">☰</button><button class="vdt-ai-max" title="Phóng to / thu nhỏ">⤢</button><button class="vdt-ai-close" title="Đóng">×</button></span></div><div class="vdt-ai-menu vdt-ai-thread-menu" hidden></div><div class="vdt-ai-menu vdt-ai-variant-menu" hidden></div><div class="vdt-ai-history"></div><form class="vdt-ai-input"><textarea maxlength="2000" placeholder="Hỏi về dữ liệu FTE, bảng hoặc SQL…"></textarea><span class="vdt-ai-buttons"><button type="submit">Gửi</button><button type="button" class="vdt-ai-compare" title="Chạy song song baseline và skills để so sánh">So sánh</button></span></form></div><button class="vdt-ai-button" aria-label="Mở AI Agent">AI Agent</button>`;
+    root.innerHTML = `<div class="vdt-ai-panel" aria-label="AI Agent"><div class="vdt-ai-header"><span class="vdt-ai-title">AI Data Agent</span><span class="vdt-ai-actions"><button class="vdt-ai-new" title="Đoạn chat mới">+</button><button class="vdt-ai-threads" title="Lịch sử đoạn chat">☰</button><button class="vdt-ai-max" title="Phóng to / thu nhỏ">⤢</button><button class="vdt-ai-close" title="Đóng">×</button></span></div><div class="vdt-ai-menu vdt-ai-thread-menu" hidden></div><div class="vdt-ai-menu vdt-ai-variant-menu" hidden></div><div class="vdt-ai-history"></div><form class="vdt-ai-input"><textarea maxlength="2000" placeholder="Hỏi về dữ liệu FTE, bảng hoặc SQL… (Enter để gửi)"></textarea><button type="submit" class="vdt-ai-send" title="Gửi (Enter)" aria-label="Gửi"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/></svg></button></form></div><button class="vdt-ai-button" aria-label="Mở AI Agent">AI Agent</button>`;
     document.body.append(root);
 
     const panel = root.querySelector('.vdt-ai-panel');
@@ -95,7 +103,6 @@
     const threadMenu = root.querySelector('.vdt-ai-thread-menu');
     const variantMenu = root.querySelector('.vdt-ai-variant-menu');
     const titleEl = root.querySelector('.vdt-ai-title');
-    const compareBtn = root.querySelector('.vdt-ai-compare');
 
     let store = loadStore();
     const activeThread = () => store.threads.find(t => t.id === store.active_thread_id) || store.threads[0];
@@ -205,10 +212,32 @@
       history.scrollTop = history.scrollHeight;
     };
 
+    // Only drawn on an empty thread: these are a way in, not a permanent toolbar,
+    // so they are dropped the moment the conversation has a first question.
+    function renderSuggestions() {
+      const wrap = document.createElement('div');
+      wrap.className = 'vdt-ai-suggest';
+      const heading = document.createElement('div');
+      heading.className = 'vdt-ai-suggest-heading';
+      heading.textContent = 'Gợi ý câu hỏi';
+      wrap.append(heading);
+      suggestions.forEach(text => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'vdt-ai-chip';
+        chip.textContent = text;
+        // requestSubmit (not submit) so the form's onsubmit handler still runs.
+        chip.onclick = () => { input.value = text; form.requestSubmit(); };
+        wrap.append(chip);
+      });
+      history.append(wrap);
+    }
+
     function renderThread() {
       const thread = activeThread();
       history.replaceChildren();
       thread.messages.forEach(message => add(message.role, message.content, message.data));
+      if (!thread.messages.length) renderSuggestions();
       titleEl.textContent = thread.variant === 'skills' ? 'AI Data Agent · skills' : 'AI Data Agent';
       history.scrollTop = history.scrollHeight;
     }
@@ -315,6 +344,7 @@
       const thread = activeThread();
       input.value = '';
       closeMenus();
+      history.querySelector('.vdt-ai-suggest')?.remove();
       add('user', question);
       thread.messages.push({ role: 'user', content: question });
       if (!thread.messages.some(m => m.role === 'agent')) thread.title = question.slice(0, 50);
@@ -337,44 +367,14 @@
       }
     };
 
-    // Compare runs both variants on one question, each under its own throwaway
-    // session id: sharing the thread's id would make the gateway resume one Claude
-    // transcript from two directions at once. The pair is shown, not stored - the
-    // thread history stays a single conversation.
-    compareBtn.onclick = async () => {
-      const question = input.value.trim();
-      if (!question) return;
-      input.value = '';
-      closeMenus();
-      panel.classList.add('vdt-ai-panel--max');
-      add('user', question);
-
-      const startedIn = activeThread().id;
-      const status = pending('Đang chạy song song baseline và skills…');
-      const settled = await Promise.all(variants.map(variant =>
-        ask(question, newId(), variant).then(
-          result => ({ variant, result }),
-          error => ({ variant, error }),
-        )));
-      status.remove();
-      if (activeThread().id !== startedIn) return;
-
-      const pair = document.createElement('div');
-      pair.className = 'vdt-ai-compare';
-      settled.forEach(({ variant, result, error }) => {
-        const column = document.createElement('div');
-        column.className = 'vdt-ai-compare-col';
-        const head = document.createElement('div');
-        head.className = 'vdt-ai-compare-head';
-        head.append(badge(variant, `vdt-ai-badge-${variant}`));
-        column.append(head);
-        column.append(error
-          ? renderMessage('agent', `Lỗi: ${error.message}`, null)
-          : renderMessage('agent', result.answer, result));
-        pair.append(column);
-      });
-      history.append(pair);
-      history.scrollTop = history.scrollHeight;
+    // Enter sends, Shift+Enter keeps the newline the textarea is there for.
+    // `isComposing` is what makes this safe for Vietnamese: with a telex/VNI IME
+    // the Enter keystroke can be the one committing a syllable, and sending on it
+    // would cut the word in half.
+    input.onkeydown = event => {
+      if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+      event.preventDefault();
+      form.requestSubmit();
     };
 
     renderThread();

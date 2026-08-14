@@ -77,8 +77,10 @@ Flow:
 - **Timing.** Each answer carries the gateway-measured end-to-end time and the
   number of MCP tool calls that turn took (`⏱ 3.2s · 2 tool`).
 - **Baseline vs Agent Skills.** New conversations are started as either
-  `baseline` or `skills` (see §6), and the **So sánh** button runs one question
-  through both at once and shows the two answers side by side.
+  `baseline` or `skills` (see §6). To compare the two, open one conversation of
+  each variant and ask the same question.
+- **Sending.** `Enter` sends, `Shift+Enter` inserts a newline. An empty
+  conversation offers a few starter questions as clickable chips.
 
 ## 5) Notes
 
@@ -132,8 +134,7 @@ The two differ by those two arguments and nothing else, so a comparison measures
 the skills and not a second changed variable. `--plugin-dir` loads the plugin for
 that one invocation (verified on CLI 2.1.197: the `init` event reports it as
 `vdt-bi@inline` and lists its skills), so the variants share no state on disk and
-two of them can run concurrently — which is what the **So sánh** button does,
-each side under its own throwaway session id.
+two of them can run concurrently — each under its own session id.
 
 Add skills by dropping `skills/<name>/SKILL.md` into
 `claude_gateway/skills_plugin/` (see the README there), then rebuild:

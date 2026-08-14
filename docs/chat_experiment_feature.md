@@ -322,7 +322,14 @@ hay không.
 - Badge `variant` hiển thị trong dropdown History (Mục A) và trong mỗi message
   agent, cạnh badge thời gian (Mục C): `[baseline] ⏱ 3.2s`.
 
-### Chế độ So sánh (Compare)
+### Chế độ So sánh (Compare) — ĐÃ GỠ
+
+> **Trạng thái: đã triển khai rồi gỡ bỏ.** Nút "So sánh" không còn trong
+> `.vdt-ai-input`; `compareBtn.onclick`, `addComparePair` và toàn bộ CSS
+> `.vdt-ai-compare*` đã bị xoá khỏi `vdt-ai-chat.js` / `vdt-ai-chat.css`. Cách
+> đối chiếu 2 variant hiện nay: mở 2 thread, mỗi thread một variant, hỏi cùng một
+> câu. Phần đặc tả dưới đây giữ lại làm tham chiếu nếu muốn dựng lại.
+
 - Nút "So sánh" cạnh nút Gửi trong `.vdt-ai-input`. Khi bấm thay vì Gửi thường:
   gửi **2 request song song** tới cùng endpoint, khác `variant` (`baseline` và
   `skills`), mỗi request dùng **session_id tạm thời riêng** (không thuộc thread
