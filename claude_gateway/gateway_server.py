@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -49,6 +50,7 @@ ALLOWED_TOOLS = ",".join(
         "run_sql_readonly",
         "create_dataset",
         "create_chart",
+        "update_chart",
         "create_dashboard",
     )
 )
@@ -56,10 +58,42 @@ ALLOWED_TOOLS = ",".join(
 # Postgres/Superset through the vetted MCP tools above, never Bash/file edits.
 DISALLOWED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task"
 
+# Tools whose JSON result carries a chart/dashboard the panel can preview inline.
+_PREVIEW_TOOLS = {"create_chart", "update_chart", "create_dashboard"}
+
+# A/B variants. "baseline" runs the exact argv this gateway has always used;
+# "skills" is that same argv plus the domain skill plugin, so a comparison isolates
+# one variable. Verified against CLI 2.1.197: --plugin-dir loads a plugin for that
+# invocation only (the init event reports it as `<name>@inline` and lists its skill
+# under `skills`), so the two variants can run concurrently without touching shared
+# state on disk - no global lock needed.
+SKILLS_PLUGIN_DIR = "/app/claude_gateway/skills_plugin"
+VARIANTS = ("baseline", "skills")
+DEFAULT_VARIANT = "baseline"
+
 _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+# The CLI's two complaints about being asked to start/continue a session the wrong
+# way round, verified against 2.1.197. Both are raised before any API call, so
+# retrying the other way is cheap; a timeout deliberately does NOT match, since
+# retrying that would double the turn's latency for no reason.
+_WRONG_SESSION_MODE = re.compile(r"is already in use|No conversation found with session ID", re.I)
 
 _known_sessions: set[str] = set()
 _known_sessions_lock = threading.Lock()
+
+# Serializes turns that share a session_id so an impatient double-send (or a
+# slow first turn overlapping a retry) can't launch two `claude -p
+# --session-id <same>` processes writing the same transcript concurrently -
+# that race was observed contributing to turns running past Superset's own
+# outbound timeout (see superset/superset_config.py).
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _lock_for_session(session_id: str) -> threading.Lock:
+    with _session_locks_guard:
+        return _session_locks.setdefault(session_id, threading.Lock())
 
 
 def _system_prompt() -> str:
@@ -73,7 +107,7 @@ def _build_prompt(question: str, context: dict[str, Any], row_limit: int) -> str
     return f"{header}\n\n{question}"
 
 
-def _build_argv(prompt: str, session_id: str, resume: bool) -> list[str]:
+def _build_argv(prompt: str, session_id: str, resume: bool, variant: str = DEFAULT_VARIANT) -> list[str]:
     argv = [
         "claude", "-p",
         "--output-format", "stream-json", "--verbose",
@@ -84,6 +118,8 @@ def _build_argv(prompt: str, session_id: str, resume: bool) -> list[str]:
         "--permission-mode", "dontAsk",
         "--append-system-prompt", _system_prompt(),
     ]
+    if variant == "skills":
+        argv += ["--plugin-dir", SKILLS_PLUGIN_DIR]
     argv += ["--resume", session_id] if resume else ["--session-id", session_id]
     argv.append(prompt)
     return argv
@@ -103,22 +139,120 @@ def _log_event(event: dict[str, Any]) -> None:
         log.info("result: is_error=%s cost=%s", event.get("is_error"), event.get("total_cost_usd"))
 
 
-def _run_claude(prompt: str, session_id: str, resume: bool) -> tuple[str | None, str | None]:
-    """Runs one headless Claude turn. Returns (answer_text, error_message)."""
-    argv = _build_argv(prompt, session_id, resume)
-    log.info("exec claude (%s, session=%s)", "resume" if resume else "new", session_id)
+def _short_tool_name(name: str) -> str:
+    prefix = f"mcp__{MCP_SERVER_NAME}__"
+    return name[len(prefix):] if name.startswith(prefix) else name
 
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd="/app")
-    deadline = time.monotonic() + DEADLINE_SECONDS
+
+def _tool_result_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get("text")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def _collect_preview(event: dict[str, Any], pending: dict[str, str], previews: list[dict[str, Any]]) -> int:
+    """Correlates tool_use ids with their tool_result and keeps previewable results.
+
+    Returns how many tool calls this event started, so the caller can count them
+    without walking the content blocks a second time. Results from the read-only
+    tools travel through here too, but none of them carry an `embed_url`, so they
+    drop out on their own.
+    """
+    etype = event.get("type")
+    started = 0
+    for block in event.get("message", {}).get("content", []) or []:
+        if not isinstance(block, dict):
+            continue
+        if etype == "assistant" and block.get("type") == "tool_use":
+            started += 1
+            tool_use_id = block.get("id")
+            if tool_use_id:
+                pending[tool_use_id] = _short_tool_name(block.get("name", ""))
+        elif etype == "user" and block.get("type") == "tool_result":
+            if pending.get(block.get("tool_use_id")) not in _PREVIEW_TOOLS:
+                continue
+            text = _tool_result_text(block.get("content"))
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(parsed, dict) and parsed.get("embed_url"):
+                previews.append(parsed)
+    return started
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kills the CLI and every process it spawned; falls back to the CLI alone."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()
+
+
+def _run_claude(
+    prompt: str, session_id: str, resume: bool, variant: str = DEFAULT_VARIANT
+) -> tuple[str | None, list[dict[str, Any]], dict[str, Any], str | None]:
+    """Runs one headless Claude turn.
+
+    Returns (answer_text, previews, timing, error_message). `timing` is always
+    populated - including on the timeout and error paths, where how long the turn
+    ran before failing is exactly what you want to know.
+    """
+    argv = _build_argv(prompt, session_id, resume, variant)
+    log.info(
+        "exec claude (%s, session=%s, variant=%s)", "resume" if resume else "new", session_id, variant
+    )
+
+    started_at = time.monotonic()
+    # start_new_session puts the CLI and everything it spawns (MCP servers, helper
+    # processes) in one process group, so the deadline can take the whole tree down.
+    proc = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd="/app", start_new_session=True
+    )
+
+    # The deadline has to be enforced by a watchdog rather than checked inside the
+    # read loop: `for line in proc.stdout` blocks until a line arrives, so a turn
+    # that stalls without printing anything (an unreachable Anthropic endpoint does
+    # exactly this - the CLI prints its `init` event and then waits) would never
+    # reach an in-loop check. The loop ends when the last writer to the pipe dies,
+    # which is why this kills the group and not just the CLI: any surviving child
+    # keeps its inherited copy of stdout open and the read stays parked.
+    timed_out = threading.Event()
+
+    watchdog = threading.Timer(DEADLINE_SECONDS, lambda: (timed_out.set(), _kill_tree(proc)))
+    watchdog.daemon = True
+    watchdog.start()
+
     answer: str | None = None
     is_error = False
+    first_event_at: float | None = None
+    tool_calls = 0
+    cli_duration_ms: int | None = None
+
+    def timing() -> dict[str, Any]:
+        return {
+            "total_ms": round((time.monotonic() - started_at) * 1000),
+            "first_event_ms": round((first_event_at - started_at) * 1000) if first_event_at else None,
+            "tool_calls": tool_calls,
+            "cli_duration_ms": cli_duration_ms,
+            "variant": variant,
+        }
+
+    pending_tool_names: dict[str, str] = {}
+    previews: list[dict[str, Any]] = []
 
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
-            if time.monotonic() > deadline:
-                proc.kill()
-                return None, "Claude gateway timed out waiting for a response"
             line = line.strip()
             if not line:
                 continue
@@ -126,44 +260,65 @@ def _run_claude(prompt: str, session_id: str, resume: bool) -> tuple[str | None,
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if first_event_at is None:
+                first_event_at = time.monotonic()
             _log_event(event)
+            tool_calls += _collect_preview(event, pending_tool_names, previews)
             if event.get("type") == "result":
                 answer = event.get("result") or ""
                 is_error = bool(event.get("is_error"))
+                if isinstance(event.get("duration_ms"), (int, float)):
+                    cli_duration_ms = round(event["duration_ms"])
     finally:
+        watchdog.cancel()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _kill_tree(proc)
 
+    # `answer is None` guards the race where the watchdog fires just as a turn
+    # finishes: a `result` event only arrives once the turn is complete, so having
+    # one means the answer beat the deadline and should be returned, not discarded.
+    if timed_out.is_set() and answer is None:
+        return None, [], timing(), "Claude gateway timed out waiting for a response"
     if answer is None and proc.returncode not in (0, None):
         stderr = proc.stderr.read()[:500] if proc.stderr else ""
-        return None, f"claude exited with code {proc.returncode}: {stderr}"
+        return None, [], timing(), f"claude exited with code {proc.returncode}: {stderr}"
     if is_error:
         # A "result" event with is_error=true still carries human-readable text
         # in `result` (e.g. "Invalid API key · Fix external API key") - surface
         # it as the error message rather than showing it to the user as a
         # normal, successful answer.
-        return None, answer or f"claude reported an error (exit code {proc.returncode})"
-    return answer, None
+        return None, [], timing(), answer or f"claude reported an error (exit code {proc.returncode})"
+    return answer, previews, timing(), None
 
 
-def _query_claude(question: str, session_id: str, context: dict[str, Any], row_limit: int) -> tuple[str | None, str | None]:
+def _query_claude(
+    question: str, session_id: str, context: dict[str, Any], row_limit: int, variant: str = DEFAULT_VARIANT
+) -> tuple[str | None, list[dict[str, Any]], dict[str, Any], str | None]:
     prompt = _build_prompt(question, context, row_limit)
-    with _known_sessions_lock:
-        seen_before = session_id in _known_sessions
-
-    answer, error = _run_claude(prompt, session_id, resume=seen_before)
-    if error and seen_before:
-        # Session transcript may be gone (gateway restarted) - fall back to a fresh session
-        # under the same id rather than failing the whole turn.
-        log.warning("resume failed for session %s (%s), retrying as a new session", session_id, error)
-        answer, error = _run_claude(prompt, session_id, resume=False)
-
-    if error is None:
+    with _lock_for_session(session_id):
         with _known_sessions_lock:
-            _known_sessions.add(session_id)
-    return answer, error
+            seen_before = session_id in _known_sessions
+
+        answer, previews, timing, error = _run_claude(prompt, session_id, resume=seen_before, variant=variant)
+        if error and _WRONG_SESSION_MODE.search(error):
+            # `_known_sessions` is in-memory, so after a gateway restart it no longer
+            # knows which ids already have a transcript - and the browser now keeps a
+            # conversation's session id across reloads, so returning threads land here
+            # routinely. The CLI rejects the wrong mode outright, before spending an
+            # API call: `--session-id` refuses an id that already has a transcript,
+            # `--resume` refuses one that has none. Either way the fix is the other
+            # mode, and retrying costs a second rather than a whole turn.
+            log.warning("wrong session mode for %s (%s), retrying the other way", session_id, error)
+            answer, previews, timing, error = _run_claude(
+                prompt, session_id, resume=not seen_before, variant=variant
+            )
+
+        if error is None:
+            with _known_sessions_lock:
+                _known_sessions.add(session_id)
+        return answer, previews, timing, error
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -193,12 +348,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
             session_id = payload.get("session_id")
             if not isinstance(session_id, str) or not _SESSION_ID_RE.match(session_id):
                 session_id = str(uuid.uuid4())
+            variant = payload.get("variant")
+            if variant not in VARIANTS:
+                variant = DEFAULT_VARIANT
 
-            answer, error = _query_claude(question, session_id, context, row_limit)
+            answer, previews, timing, error = _query_claude(question, session_id, context, row_limit, variant)
             if error:
-                self._reply(502, {"message": error})
+                self._reply(502, {"message": error, "timing": timing, "variant": variant})
                 return
-            self._reply(200, {"answer": answer or ""})
+            self._reply(200, {"answer": answer or "", "previews": previews, "timing": timing, "variant": variant})
+        except (BrokenPipeError, ConnectionResetError):
+            # The client gave up while the turn was still running (tab closed, or
+            # the Superset proxy's socket timed out first). Nobody is left to reply
+            # to, and the generic handler below would try anyway and raise a second,
+            # uncaught BrokenPipeError - which is what buried this in a stack trace
+            # logged as "Unhandled error while querying Claude".
+            log.info("client disconnected before the reply could be sent")
         except (ValueError, json.JSONDecodeError) as error:
             self._reply(400, {"message": str(error)})
         except Exception:

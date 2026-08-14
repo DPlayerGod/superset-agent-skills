@@ -6,6 +6,7 @@ import os
 import json
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from socket import timeout as SocketTimeout
 
 from flask import Blueprint, Response, current_app, jsonify, request, send_from_directory
 from flask_login import current_user
@@ -28,7 +29,15 @@ def FLASK_APP_MUTATOR(app):
 
     @chat.get("/static/<path:filename>")
     def static_asset(filename: str):
-        return send_from_directory(f"{AI_CHAT_DIR}/static", filename)
+        response = send_from_directory(f"{AI_CHAT_DIR}/static", filename)
+        # Superset serves static files with a one-year max-age. These two are baked
+        # into the image and change with every rebuild, under a filename that never
+        # changes - so a cached copy silently outlives any number of deploys and the
+        # panel keeps running last month's code. "no-cache" still caches; it just
+        # forces revalidation, and the ETag turns the usual request into a 304.
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers.pop("Expires", None)
+        return response
 
     @chat.post("/query")
     def query():
@@ -48,10 +57,17 @@ def FLASK_APP_MUTATOR(app):
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urlopen(outbound, timeout=120) as response:
+            # Longer than the gateway's own DEADLINE_SECONDS (claude_gateway/gateway_server.py)
+            # so the gateway always times out first and replies with a proper JSON
+            # error, instead of this socket giving up first and leaving Flask to
+            # serve an HTML error page that the frontend can't JSON.parse().
+            with urlopen(outbound, timeout=170) as response:
                 return Response(response.read(), status=response.status, content_type="application/json")
         except HTTPError as error:
             return Response(error.read(), status=error.code, content_type="application/json")
+        except SocketTimeout:
+            current_app.logger.exception("VDT AI gateway timed out")
+            return jsonify({"message": "AI gateway timed out waiting for a response"}), 504
         except URLError:
             current_app.logger.exception("VDT AI gateway is unavailable")
             return jsonify({"message": "AI gateway is unavailable"}), 503

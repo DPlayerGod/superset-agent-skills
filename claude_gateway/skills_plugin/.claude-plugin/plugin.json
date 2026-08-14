@@ -1,0 +1,8 @@
+{
+  "name": "vdt-bi",
+  "version": "0.1.0",
+  "description": "Domain skills for the super_dplayergod Daily FTE assistant: standard reporting recipes and data quality checks over fact_employee_allocation.",
+  "author": {
+    "name": "super_dplayergod"
+  }
+}

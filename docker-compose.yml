@@ -26,10 +26,13 @@ services:
       SUPERSET_SECRET_KEY: "super_secret_key_987654321_abc"
       AGENT_GATEWAY_URL: http://claude_gateway:8090
     user: root
+    # psycopg2-binary is installed at build time (superset/Dockerfile), so it is
+    # deliberately NOT reinstalled here: doing that on every start made a container
+    # restart depend on reaching pypi.org, and the whole `&&` chain - and with it
+    # Superset - never came up when egress was unavailable.
     entrypoint: >
       /bin/sh -c "
       echo 'Bootstrapping Apache Superset...' &&
-      pip install --no-cache-dir psycopg2-binary --target=/app/.venv/lib/python3.10/site-packages &&
       superset db upgrade &&
       superset fab create-admin --username admin --firstname Super --lastname Admin --email admin@super.com --password admin || true &&
       superset init &&
@@ -56,6 +59,11 @@ services:
       DATABASE_URL: postgresql://super_user:super_pass@postgres:5432/super_db
       MCP_MAX_ROWS: 500
       SUPERSET_URL: http://superset:8088
+      # Browser-facing base URL. SUPERSET_URL above is the in-network hostname used
+      # for REST calls and does not resolve outside Docker, so links/iframes handed
+      # to the browser are built from this one instead. Override when deploying
+      # anywhere other than localhost.
+      SUPERSET_PUBLIC_URL: ${SUPERSET_PUBLIC_URL:-http://localhost:8088}
       SUPERSET_ADMIN_USERNAME: admin
       SUPERSET_ADMIN_PASSWORD: admin
       CLAUDE_GATEWAY_PORT: 8090

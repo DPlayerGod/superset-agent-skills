@@ -15,6 +15,9 @@ DATABASE_URL = os.getenv(
 MAX_LIMIT = int(os.getenv("MCP_MAX_ROWS", "500"))
 
 SUPERSET_URL = os.getenv("SUPERSET_URL", "http://superset:8088").rstrip("/")
+# Everything the browser has to load (links, preview iframes) is built from this
+# instead of SUPERSET_URL, whose Docker-internal hostname does not resolve there.
+SUPERSET_PUBLIC_URL = os.getenv("SUPERSET_PUBLIC_URL", SUPERSET_URL).rstrip("/")
 SUPERSET_ADMIN_USERNAME = os.getenv("SUPERSET_ADMIN_USERNAME", "admin")
 SUPERSET_ADMIN_PASSWORD = os.getenv("SUPERSET_ADMIN_PASSWORD", "admin")
 
@@ -193,7 +196,7 @@ def _get_or_create_postgres_database(sess: requests.Session) -> int:
     resp = sess.get(f"{SUPERSET_URL}/api/v1/database/", params={"q": "(page_size:100)"}, timeout=15)
     resp.raise_for_status()
     for row in resp.json().get("result", []):
-        if "postgres" in row.get("sqlalchemy_uri", ""):
+        if row.get("backend") == "postgresql":
             return row["id"]
 
     create = sess.post(
@@ -268,11 +271,41 @@ def _build_chart_params(
     if viz_type in ("echarts_timeseries_line", "echarts_timeseries_bar"):
         params["x_axis"] = groupby[0] if groupby else None
         params["groupby"] = list(groupby[1:])
+    elif viz_type == "pie":
+        # Pie's control panel is [["groupby"], ["metric"]] - it reads a single
+        # `metric` and ignores `metrics` entirely, so a plural list renders blank.
+        params["metric"] = adhoc_metrics[0] if adhoc_metrics else None
+        params.pop("metrics", None)
     elif viz_type == "big_number_total":
         params["metric"] = adhoc_metrics[0] if adhoc_metrics else None
         params.pop("metrics", None)
         params.pop("groupby", None)
     return params
+
+
+# `standalone` values verified against this exact Superset 6.1.0 build rather than
+# assumed: the explore view treats the parameter as a boolean
+# (superset/utils/core.py: any value other than "0"/"false" counts as standalone),
+# while the dashboard frontend reads it as the numeric DashboardStandaloneMode enum
+# (None=0, HideNav=1, HideNavAndTitle=2, Report=3 - read out of the shipped JS
+# bundle). Chart previews use 1; dashboard previews use 2 so the title bar does not
+# eat vertical space in the small chat iframe.
+_EXPLORE_STANDALONE = "1"
+_DASHBOARD_STANDALONE = "2"
+
+
+def _chart_urls(chart_id: int) -> dict[str, Any]:
+    base = f"{SUPERSET_PUBLIC_URL}/explore/?slice_id={chart_id}"
+    return {"type": "chart", "url": base, "embed_url": f"{base}&standalone={_EXPLORE_STANDALONE}"}
+
+
+def _dashboard_urls(dashboard_id: int) -> dict[str, Any]:
+    base = f"{SUPERSET_PUBLIC_URL}/superset/dashboard/{dashboard_id}/"
+    return {
+        "type": "dashboard",
+        "url": base,
+        "embed_url": f"{base}?standalone={_DASHBOARD_STANDALONE}",
+    }
 
 
 @mcp.tool()
@@ -290,6 +323,9 @@ def create_chart(
     viz_type: one of "table", "echarts_timeseries_line", "echarts_timeseries_bar",
     "pie", "big_number_total".
     metrics: SQL aggregate expressions, e.g. ["SUM(project_allocated_hc)"].
+    Note: "pie" and "big_number_total" only support a single metric - only
+    metrics[0] is used. To compare several metrics, use "table" or
+    "echarts_timeseries_bar" instead.
     """
     sess = _superset_session()
     params = _build_chart_params(viz_type, metrics, groupby or [], time_range, row_limit)
@@ -306,7 +342,75 @@ def create_chart(
     )
     resp.raise_for_status()
     chart_id = resp.json()["id"]
-    return {"chart_id": chart_id, "url": f"{SUPERSET_URL}/explore/?slice_id={chart_id}"}
+    return {"chart_id": chart_id, **_chart_urls(chart_id)}
+
+
+def _extract_chart_spec(params: dict[str, Any]) -> tuple[str, list[str], list[str], str, int]:
+    """Reverses _build_chart_params so update_chart can inherit fields the caller omits."""
+    viz_type = params.get("viz_type", "table")
+    time_range = params.get("time_range", "No filter")
+    row_limit = params.get("row_limit", 1000)
+
+    def expr(metric: Any) -> str:
+        return metric.get("sqlExpression", "") if isinstance(metric, dict) else str(metric)
+
+    if viz_type in ("pie", "big_number_total"):
+        # `or params.get("metrics")` recovers charts written before pie was mapped
+        # to the singular `metric`, so a partial update does not blank them out.
+        metric = params.get("metric") or next(iter(params.get("metrics") or []), None)
+        metrics = [expr(metric)] if metric else []
+        groupby: list[str] = [] if viz_type == "big_number_total" else list(params.get("groupby", []))
+    elif viz_type in ("echarts_timeseries_line", "echarts_timeseries_bar"):
+        x_axis = params.get("x_axis")
+        metrics = [expr(m) for m in params.get("metrics", [])]
+        groupby = ([x_axis] if x_axis else []) + list(params.get("groupby", []))
+    else:
+        metrics = [expr(m) for m in params.get("metrics", [])]
+        groupby = list(params.get("groupby", []))
+    return viz_type, metrics, groupby, time_range, row_limit
+
+
+@mcp.tool()
+def update_chart(
+    chart_id: int,
+    chart_name: str | None = None,
+    viz_type: str | None = None,
+    metrics: list[str] | None = None,
+    groupby: list[str] | None = None,
+    time_range: str | None = None,
+    row_limit: int | None = None,
+) -> dict[str, Any]:
+    """Edits an existing Superset chart in place. Any argument left as None keeps
+    its current value; pass only the fields you want to change.
+
+    Same viz_type/metrics semantics as create_chart.
+    """
+    sess = _superset_session()
+    current = sess.get(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=15)
+    current.raise_for_status()
+    current_result = current.json()["result"]
+    current_params = json.loads(current_result.get("params") or "{}")
+    cur_viz, cur_metrics, cur_groupby, cur_time_range, cur_row_limit = _extract_chart_spec(current_params)
+
+    effective_viz_type = viz_type if viz_type is not None else cur_viz
+    new_params = _build_chart_params(
+        effective_viz_type,
+        metrics if metrics is not None else cur_metrics,
+        groupby if groupby is not None else cur_groupby,
+        time_range if time_range is not None else cur_time_range,
+        row_limit if row_limit is not None else cur_row_limit,
+    )
+
+    payload: dict[str, Any] = {
+        "viz_type": effective_viz_type,
+        "params": json.dumps(new_params),
+    }
+    if chart_name is not None:
+        payload["slice_name"] = chart_name
+
+    resp = sess.put(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", json=payload, timeout=20)
+    resp.raise_for_status()
+    return {"chart_id": chart_id, **_chart_urls(chart_id)}
 
 
 @mcp.tool()
@@ -329,11 +433,7 @@ def create_dashboard(dashboard_title: str, chart_ids: list[int]) -> dict[str, An
         )
         attach.raise_for_status()
 
-    return {
-        "dashboard_id": dashboard_id,
-        "url": f"{SUPERSET_URL}/superset/dashboard/{dashboard_id}/",
-        "chart_ids": chart_ids,
-    }
+    return {"dashboard_id": dashboard_id, **_dashboard_urls(dashboard_id), "chart_ids": chart_ids}
 
 
 if __name__ == "__main__":
