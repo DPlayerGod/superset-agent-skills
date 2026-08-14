@@ -136,11 +136,45 @@ that one invocation (verified on CLI 2.1.197: the `init` event reports it as
 `vdt-bi@inline` and lists its skills), so the variants share no state on disk and
 two of them can run concurrently — each under its own session id.
 
-Add skills by dropping `skills/<name>/SKILL.md` into
-`claude_gateway/skills_plugin/` (see the README there), then rebuild:
+The plugin (`vdt-bi`) currently carries five skills:
 
+| Skill | Covers |
+|---|---|
+| `vdt-bi` | Root routing, read/write boundary, no-fabrication rules. |
+| `vdt-fte-sql` | SQL over `fact_employee_allocation`: FTE vs headcount, time grains, ready recipes. |
+| `vdt-charting` | `create_dataset` → `create_chart`/`update_chart`, `viz_type` and `params` constraints. |
+| `vdt-dashboards` | `create_dashboard` assembly and its chart-reattachment behaviour. |
+| `vdt-troubleshooting` | Empty results, SQL errors, truncation, blank charts, write failures. |
+
+Their structure — the `## Always` / `## Decision Rules` / `## Workflow Order` shape
+and the narrow-skill routing model — is ported from
+[preset-io/agent-skills](https://github.com/preset-io/agent-skills) v0.4.3
+(`preset-mcp-skills`, Apache-2.0). The content is not: that package targets
+Superset's official MCP service, whose 27 tools barely overlap with the 7 in
+`mcp_server.py`, so the instructions were rewritten against the local tools.
+`claude_gateway/skills_plugin/AGENTS.md` records the upstream→local mapping.
+
+Two constraints when writing a skill here, both easy to violate silently:
+
+- **Self-contained only.** No `references/*.md` and no `## Retrieve` section — the
+  gateway denies the `Read` tool, so a progressive-disclosure link cannot be
+  followed at runtime.
+- **Do not restate the system prompt.** `role_prompt.md` + `mock_data_docs.md` load
+  for *both* variants, so anything copied from them appears in `baseline` too and
+  cancels out of the comparison instead of showing up as a difference.
+
+Add or edit skills under `claude_gateway/skills_plugin/skills/<name>/SKILL.md` (see
+the README there), then check and rebuild:
+
+    python3 claude_gateway/skills_plugin/scripts/check_tool_drift.py
     docker compose up -d --build claude_gateway
     docker compose exec -T claude_gateway claude plugin validate /app/claude_gateway/skills_plugin
+
+`check_tool_drift.py` (ported from upstream's `check-tool-inventory.py`) catches the
+drift that is otherwise invisible until a turn fails: a skill naming a tool
+`mcp_server.py` does not define, a misspelled column, a frontmatter `name` that no
+longer matches its directory, an `ALLOWED_TOOLS` allowlist out of sync with the MCP
+server, and any reintroduced `references/` link.
 
 A conversation's variant is fixed when it is created and cannot be switched
 mid-thread: the gateway resumes it with `--resume`, and changing the tools or
