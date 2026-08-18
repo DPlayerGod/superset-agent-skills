@@ -51,7 +51,7 @@
     } catch { /* nothing usable to migrate */ }
 
     if (!store.threads.length) {
-      const thread = blankThread('baseline');
+      const thread = blankThread();
       store.threads.push(thread);
       store.active_thread_id = thread.id;
     }
@@ -165,14 +165,19 @@
       });
     }
 
+    // Shared by the finished message and by each streamed chunk, so a half-written
+    // answer is marked up the same way the final one will be. escapeHtml runs first
+    // and on the whole string, which is what keeps this safe for model-written text.
+    const formatAgent = text => escapeHtml(text)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\n/g, '<br>');
+
     // Built with createElement/textContent rather than innerHTML: the values come
     // back from the gateway, and one of them (the answer) is model-written text.
     function renderMessage(role, content, data) {
       const message = document.createElement('article');
       message.className = `vdt-ai-message vdt-ai-${role}`;
-      message.innerHTML = role === 'agent'
-        ? escapeHtml(content).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br>')
-        : escapeHtml(content);
+      message.innerHTML = role === 'agent' ? formatAgent(content) : escapeHtml(content);
 
       if (data?.sql) {
         const sql = document.createElement('pre');
@@ -301,22 +306,55 @@
       variantMenu.hidden = false;
     }
 
-    const ask = (question, thread_session_id, variant) => fetch('/api/v1/vdt-ai-chat/query', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question,
-        session_id: thread_session_id,
-        variant,
-        context: { path: location.pathname },
-        row_limit: 200,
-      }),
-    }).then(async response => {
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.message || 'Không thể xử lý yêu cầu');
-      return result;
-    });
+    // Server-Sent Events, read by hand rather than with EventSource: EventSource is
+    // GET-only and cannot carry the question body. `onEvent` is called for every
+    // progress event; the promise resolves with the final `done` event, whose shape
+    // is the same {answer, previews, timing, variant} the buffered endpoint returns.
+    const ask = async (question, thread_session_id, variant, onEvent) => {
+      const response = await fetch('/api/v1/vdt-ai-chat/stream', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question,
+          session_id: thread_session_id,
+          variant,
+          context: { path: location.pathname },
+          row_limit: 200,
+        }),
+      });
+      // A rejected request (401/400) never becomes a stream, so it still answers
+      // in JSON and is read as such.
+      if (!response.ok || !response.body) {
+        const failure = await response.json().catch(() => ({}));
+        throw new Error(failure.message || 'Không thể xử lý yêu cầu');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finished = null;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // An event ends at a blank line; anything after the last one is a partial
+        // frame and stays in the buffer until the rest of it arrives.
+        let boundary;
+        while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const line = frame.split('\n').find(part => part.startsWith('data:'));
+          if (!line) continue;
+          let event;
+          try { event = JSON.parse(line.slice(5)); } catch { continue; }
+          if (event.type === 'error') throw new Error(event.message || 'Không thể xử lý yêu cầu');
+          if (event.type === 'done') finished = event; else onEvent(event);
+        }
+      }
+      if (!finished) throw new Error('Kết nối bị ngắt trước khi có câu trả lời');
+      return finished;
+    };
 
     const pending = text => {
       const status = document.createElement('article');
@@ -351,9 +389,38 @@
       thread.updated_at = new Date().toISOString();
       saveStore(store);
 
+      // One element carries the whole turn: first the progress line, then the answer
+      // as it streams in, and it is replaced by the fully rendered message (previews,
+      // timing badges) once `done` arrives.
       const status = pending('Đang phân tích dữ liệu…');
+      let streamed = '';
+      const waiting = text => {
+        streamed = '';
+        status.classList.add('vdt-ai-muted');
+        status.textContent = text;
+        history.scrollTop = history.scrollHeight;
+      };
+      const onEvent = event => {
+        // A reply that arrives after the user switched threads is still stored on
+        // its own thread below, but must not redraw over the conversation on screen.
+        if (activeThread().id !== thread.id) return;
+        if (event.type === 'tool') {
+          waiting(`Đang chạy ${event.name}…`);
+        } else if (event.type === 'reset') {
+          // A new assistant message began. Anything streamed before it was narration
+          // leading up to a tool call, not the answer - drop it, the way the buffered
+          // endpoint does by returning only the final message.
+          if (streamed) waiting('Đang soạn câu trả lời…');
+        } else if (event.type === 'delta') {
+          streamed += event.text;
+          status.classList.remove('vdt-ai-muted');
+          status.innerHTML = formatAgent(streamed);
+          history.scrollTop = history.scrollHeight;
+        }
+      };
+
       try {
-        const result = await ask(question, thread.session_id, thread.variant);
+        const result = await ask(question, thread.session_id, thread.variant, onEvent);
         status.remove();
         thread.messages.push({ role: 'agent', content: result.answer, data: result });
         thread.updated_at = new Date().toISOString();
@@ -363,7 +430,9 @@
         // must not drop another conversation's reply into this one.
         if (activeThread().id === thread.id) add('agent', result.answer, result);
       } catch (error) {
-        if (activeThread().id === thread.id) status.textContent = `Lỗi: ${error.message}`;
+        // The element may be mid-answer by now, so this restores the status look
+        // rather than leaving an error line styled as a finished reply.
+        if (activeThread().id === thread.id) waiting(`Lỗi: ${error.message}`);
       }
     };
 

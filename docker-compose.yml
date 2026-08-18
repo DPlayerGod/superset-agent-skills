@@ -54,8 +54,12 @@ services:
     working_dir: /app
     command: python3 gateway_server.py
     environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in your shell or a .env file before running docker compose up}
-      ANTHROPIC_BASE_URL: https://1gw.gwai.cloud
+      # Generate with `claude setup-token` (on a machine logged into a Claude
+      # Pro/Max account via `claude login`) - this bills against that account's
+      # subscription quota instead of pay-per-token API usage. No
+      # ANTHROPIC_BASE_URL here: OAuth subscription auth only works against
+      # Anthropic's own endpoint, not a custom API-key proxy.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?Set CLAUDE_CODE_OAUTH_TOKEN in your shell or a .env file before running docker compose up. Generate it with `claude setup-token`.}
       DATABASE_URL: postgresql://super_user:super_pass@postgres:5432/super_db
       MCP_MAX_ROWS: 500
       SUPERSET_URL: http://superset:8088
@@ -67,6 +71,9 @@ services:
       SUPERSET_ADMIN_USERNAME: admin
       SUPERSET_ADMIN_PASSWORD: admin
       CLAUDE_GATEWAY_PORT: 8090
+      # Alias ("sonnet", "opus", "fable") or full model name
+      # ("claude-haiku-4-5-20251001"). Leave unset to use the CLI's own default.
+      CLAUDE_GATEWAY_MODEL: ${CLAUDE_GATEWAY_MODEL:-}
     volumes:
       - claude_home:/home/node/.claude
 

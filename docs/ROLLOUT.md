@@ -2,13 +2,21 @@
 
 ## 1) Start infrastructure
 
-Set your Anthropic API key before starting (never commit it):
+The gateway authenticates as a Claude Pro/Max account rather than an API key, so
+usage bills against that account's subscription quota instead of pay-per-token API
+usage. Generate a long-lived OAuth token once, on any machine with the Claude Code
+CLI logged into the account you want billed:
 
-export ANTHROPIC_API_KEY=sk-ant-...
+    claude login         # if not already logged in
+    claude setup-token   # prints a token
+
+Set that token before starting (never commit it):
+
+export CLAUDE_CODE_OAUTH_TOKEN=...
 
 Or create a `.env` file in the project root (do not commit it) with:
 
-ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_CODE_OAUTH_TOKEN=...
 
 Then, from project root:
 
@@ -120,67 +128,33 @@ Flow:
   the `POST /api/v1/chart/` call) and adjust `_build_chart_params` in
   `mcp_server.py`.
 
-## 6) Baseline vs Agent Skills (A/B)
+## 6) Variants and Plugin Marketplace
 
-Every request carries a `variant`, defaulting to `baseline` when absent, and the
-response echoes it back next to `timing`:
+Each request carries a `variant` (`baseline` or `skills`), defaulting to `baseline`,
+and the response echoes it back in the `timing` object. Since 2026-08-18, both
+variants run the same exact CLI argv — `variant` is **semantic only**, used for UI
+labeling (thread title, badge in message history) and logging/metrics.
 
-| Variant    | What the gateway runs                                              |
-|------------|--------------------------------------------------------------------|
-| `baseline` | Exactly the argv this gateway has always used. Nothing added.       |
-| `skills`   | That same argv **plus** `--plugin-dir /app/claude_gateway/skills_plugin`. |
+| Variant    | Intent |
+|------------|----|
+| `baseline` | Default; no special labeling. |
+| `skills`   | Conversation marked as "using skills mode" — a historical label from when this controlled plugin loading. |
 
-The two differ by those two arguments and nothing else, so a comparison measures
-the skills and not a second changed variable. `--plugin-dir` loads the plugin for
-that one invocation (verified on CLI 2.1.197: the `init` event reports it as
-`vdt-bi@inline` and lists its skills), so the variants share no state on disk and
-two of them can run concurrently — each under its own session id.
+The old custom skill plugin (`claude_gateway/skills_plugin`) was removed on
+2026-08-18 after A/B measurement showed its unique value had already been migrated
+to shared code paths (`mcp_server.py` docstrings, `role_prompt.md`). See
+[ab_results.md](ab_results.md) for the full experiment writeup.
 
-The plugin (`vdt-bi`) currently carries five skills:
+**Dev-time plugin marketplace:** A project-wide marketplace is registered in
+`.claude/settings.json`, sourcing plugins from
+[preset-io/agent-skills](https://github.com/preset-io/agent-skills) on GitHub. This
+marketplace is available to Claude Code when working in this repo directory, for
+reference and exploration — none of its plugins are auto-enabled (3 plugins exist;
+2 are Preset Cloud–specific, 1 targets Superset's official MCP service — not this
+project's custom `mcp_server.py`). A developer can run `/plugin install <name>@preset-agent-skills`
+locally if curious.
 
-| Skill | Covers |
-|---|---|
-| `vdt-bi` | Root routing, read/write boundary, no-fabrication rules. |
-| `vdt-fte-sql` | SQL over `fact_employee_allocation`: FTE vs headcount, time grains, ready recipes. |
-| `vdt-charting` | `create_dataset` → `create_chart`/`update_chart`, `viz_type` and `params` constraints. |
-| `vdt-dashboards` | `create_dashboard` assembly and its chart-reattachment behaviour. |
-| `vdt-troubleshooting` | Empty results, SQL errors, truncation, blank charts, write failures. |
-
-Their structure — the `## Always` / `## Decision Rules` / `## Workflow Order` shape
-and the narrow-skill routing model — is ported from
-[preset-io/agent-skills](https://github.com/preset-io/agent-skills) v0.4.3
-(`preset-mcp-skills`, Apache-2.0). The content is not: that package targets
-Superset's official MCP service, whose 27 tools barely overlap with the 7 in
-`mcp_server.py`, so the instructions were rewritten against the local tools.
-`claude_gateway/skills_plugin/AGENTS.md` records the upstream→local mapping.
-
-Two constraints when writing a skill here, both easy to violate silently:
-
-- **Self-contained only.** No `references/*.md` and no `## Retrieve` section — the
-  gateway denies the `Read` tool, so a progressive-disclosure link cannot be
-  followed at runtime.
-- **Do not restate the system prompt.** `role_prompt.md` + `mock_data_docs.md` load
-  for *both* variants, so anything copied from them appears in `baseline` too and
-  cancels out of the comparison instead of showing up as a difference.
-
-Add or edit skills under `claude_gateway/skills_plugin/skills/<name>/SKILL.md` (see
-the README there), then check and rebuild:
-
-    python3 claude_gateway/skills_plugin/scripts/check_tool_drift.py
-    docker compose up -d --build claude_gateway
-    docker compose exec -T claude_gateway claude plugin validate /app/claude_gateway/skills_plugin
-
-`check_tool_drift.py` (ported from upstream's `check-tool-inventory.py`) catches the
-drift that is otherwise invisible until a turn fails: a skill naming a tool
-`mcp_server.py` does not define, a misspelled column, a frontmatter `name` that no
-longer matches its directory, an `ALLOWED_TOOLS` allowlist out of sync with the MCP
-server, and any reintroduced `references/` link.
-
-A conversation's variant is fixed when it is created and cannot be switched
-mid-thread: the gateway resumes it with `--resume`, and changing the tools or
-prompt half way through a transcript the model already remembers produces
-behaviour nobody can reason about.
-
-Note when reading results: the CLI also ships built-in skills (`code-review`,
-`deep-research`, …) and those are present in **both** variants, so they cancel out
-of the comparison rather than distorting it.
+A conversation's variant badge is fixed when the thread is created and cannot be
+switched mid-thread: the gateway resumes it with `--resume`, and changing labels
+mid-transcript is confusing. The variant field persists in browser storage
+(`localStorage`) so reloads preserve it.

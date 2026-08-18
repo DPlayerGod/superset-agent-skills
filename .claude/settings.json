@@ -1,0 +1,7 @@
+{
+  "extraKnownMarketplaces": {
+    "preset-agent-skills": {
+      "source": { "source": "github", "path": "preset-io/agent-skills" }
+    }
+  }
+}

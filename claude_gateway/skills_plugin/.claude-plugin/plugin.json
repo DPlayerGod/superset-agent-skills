@@ -1,8 +1,0 @@
-{
-  "name": "vdt-bi",
-  "version": "0.2.0",
-  "description": "Domain skills for the super_dplayergod Daily FTE assistant: routing, SQL recipes over fact_employee_allocation, chart and dashboard construction, and failure diagnosis for the superset-postgres MCP tools.",
-  "author": {
-    "name": "super_dplayergod"
-  }
-}

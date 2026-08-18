@@ -327,8 +327,7 @@ tradeoff của bản V1, không phải per-user identity forwarding.
 
 | Biến | Service | Mặc định | Ghi chú |
 | --- | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | gateway | *(bắt buộc)* | Compose fail ngay nếu thiếu. |
-| `ANTHROPIC_BASE_URL` | gateway | `https://1gw.gwai.cloud` | |
+| `CLAUDE_CODE_OAUTH_TOKEN` | gateway | *(bắt buộc)* | Sinh bằng `claude setup-token`; trừ quota subscription (Pro/Max) của tài khoản đó, không phải API key trả theo token. Compose fail ngay nếu thiếu. |
 | `DATABASE_URL` | gateway → MCP | `postgresql://super_user:…@postgres:5432/super_db` | |
 | `MCP_MAX_ROWS` | gateway → MCP | `500` | Trần cứng của `run_sql_readonly`. |
 | `SUPERSET_URL` | gateway → MCP | `http://superset:8088` | REST nội bộ. |

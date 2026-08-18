@@ -17,8 +17,6 @@ COPY claude_gateway/gateway_server.py /app/gateway_server.py
 COPY claude_gateway/render_config.py /app/render_config.py
 COPY claude_gateway/role_prompt.md /app/claude_gateway/role_prompt.md
 COPY claude_gateway/mcp_servers.json.template /app/mcp_servers.json.template
-# Loaded via --plugin-dir only for the "skills" A/B variant (gateway_server.py).
-COPY claude_gateway/skills_plugin /app/claude_gateway/skills_plugin
 
 # Reuse the existing schema/business-rules doc as part of the system prompt
 # instead of duplicating it.
