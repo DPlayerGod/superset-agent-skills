@@ -121,3 +121,5 @@ docker exec -it super_superset superset fab reset-password --username admin --pa
 # Health check gateway (từ trong network)
 docker exec super_superset curl -s http://claude_gateway:8090/health
 ```
+python test_script/test_ab_suite.py 5          # 5 vòng full
+python test_script/analyze_ab_results.py result/ab_test_results_*.csv

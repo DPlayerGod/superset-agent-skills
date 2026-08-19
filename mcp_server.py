@@ -119,11 +119,15 @@ def describe_table(table_name: str, schema: str = "public") -> dict[str, Any]:
 
 
 @mcp.tool()
-def run_sql_readonly(sql: str, row_limit: int = 200) -> dict[str, Any]:
-    if not _is_readonly_sql(sql):
+def run_sql_readonly(sql: str | None = None, query: str | None = None, row_limit: int = 200) -> dict[str, Any]:
+    actual_sql = sql or query
+    if not actual_sql:
+        raise ValueError("Either 'sql' or 'query' parameter is required")
+
+    if not _is_readonly_sql(actual_sql):
         raise ValueError("Only SELECT/CTE read-only SQL is allowed")
 
-    safe_sql = _enforce_limit(sql, row_limit)
+    safe_sql = _enforce_limit(actual_sql, row_limit)
     with engine.connect() as conn:
         result = conn.execute(text(safe_sql))
         rows = result.fetchall()
@@ -135,6 +139,13 @@ def run_sql_readonly(sql: str, row_limit: int = 200) -> dict[str, Any]:
         "columns": columns,
         "rows": _rows_to_json(rows, columns),
     }
+
+
+@mcp.tool()
+def execute_sql(sql: str | None = None, query: str | None = None, row_limit: int = 200) -> dict[str, Any]:
+    """Execute read-only SELECT/CTE SQL statement on database (alias for run_sql_readonly)."""
+    return run_sql_readonly(sql=sql, query=query, row_limit=row_limit)
+
 
 
 # --- Superset REST API write tools ---------------------------------------
@@ -279,6 +290,13 @@ def create_dataset(table_name: str, schema: str = "public", sql: str | None = No
     resp = sess.post(f"{SUPERSET_URL}/api/v1/dataset/", json=payload, timeout=30)
     resp.raise_for_status()
     return {"dataset_id": resp.json()["id"], "already_existed": False, "virtual": sql is not None}
+
+
+@mcp.tool()
+def create_virtual_dataset(table_name: str, schema: str = "public", sql: str | None = None) -> dict[str, Any]:
+    """Registers a virtual or physical Superset dataset (alias for create_dataset)."""
+    return create_dataset(table_name=table_name, schema=schema, sql=sql)
+
 
 
 def _adhoc_metric(expression: str) -> dict[str, Any]:
@@ -526,6 +544,37 @@ def create_chart(
     return {"created": True, "chart_id": chart_id, **_chart_urls(chart_id)}
 
 
+@mcp.tool()
+def generate_chart(
+    dataset_id: int,
+    chart_name: str,
+    viz_type: str,
+    metrics: list[str],
+    groupby: list[str] | None = None,
+    time_range: str = "No filter",
+    row_limit: int = 1000,
+    color_scheme: str | None = None,
+    show_legend: bool | None = None,
+    number_format: str | None = None,
+    confirm_token: str | None = None,
+) -> dict[str, Any]:
+    """Creates a Superset chart on an existing dataset (alias for create_chart)."""
+    return create_chart(
+        dataset_id=dataset_id,
+        chart_name=chart_name,
+        viz_type=viz_type,
+        metrics=metrics,
+        groupby=groupby,
+        time_range=time_range,
+        row_limit=row_limit,
+        color_scheme=color_scheme,
+        show_legend=show_legend,
+        number_format=number_format,
+        confirm_token=confirm_token,
+    )
+
+
+
 def _extract_chart_spec(
     params: dict[str, Any],
 ) -> tuple[str, list[str], list[str], str, int, str | None, bool | None, str | None]:
@@ -695,6 +744,13 @@ def create_dashboard(dashboard_title: str, chart_ids: list[int], confirm_token: 
         **_dashboard_urls(dashboard_id),
         "chart_ids": payload["chart_ids"],
     }
+
+
+@mcp.tool()
+def generate_dashboard(dashboard_title: str, chart_ids: list[int], confirm_token: str | None = None) -> dict[str, Any]:
+    """Creates a Superset dashboard and attaches charts to it (alias for create_dashboard)."""
+    return create_dashboard(dashboard_title=dashboard_title, chart_ids=chart_ids, confirm_token=confirm_token)
+
 
 
 # --- Two-phase confirm tokens ------------------------------------------------
@@ -978,6 +1034,216 @@ def add_charts_to_dashboard(dashboard_id: int, chart_ids: list[int]) -> dict[str
         "added": added,
         "already_present": already_present,
         **_dashboard_urls(dashboard_id),
+    }
+
+
+@mcp.tool()
+def add_chart_to_existing_dashboard(dashboard_id: int, chart_ids: list[int]) -> dict[str, Any]:
+    """Adds charts to an EXISTING dashboard (alias for add_charts_to_dashboard)."""
+    return add_charts_to_dashboard(dashboard_id=dashboard_id, chart_ids=chart_ids)
+
+
+
+@mcp.tool()
+def health_check() -> dict[str, Any]:
+    """Returns the health status of the database and Superset connections."""
+    status = "ok"
+    details = {}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        details["database"] = "ok"
+    except Exception as e:
+        status = "error"
+        details["database"] = f"failed: {str(e)}"
+
+    try:
+        sess = _superset_session()
+        resp = sess.get(f"{SUPERSET_URL}/api/v1/security/csrf_token/", timeout=10)
+        resp.raise_for_status()
+        details["superset"] = "ok"
+    except Exception as e:
+        status = "error"
+        details["superset"] = f"failed: {str(e)}"
+
+    return {"status": status, "details": details}
+
+
+@mcp.tool()
+def get_instance_info() -> dict[str, Any]:
+    """Returns metadata about the Superset instance (domain, version, etc.)."""
+    return {
+        "superset_url": SUPERSET_PUBLIC_URL,
+        "database_backend": "postgresql",
+        "description": "Superset instance serving postgres analytics workspace.",
+    }
+
+
+@mcp.tool()
+def list_charts() -> dict[str, Any]:
+    """Lists all charts currently available in Apache Superset."""
+    sess = _superset_session()
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/chart/?q=(page_size:1000)", timeout=15)
+    resp.raise_for_status()
+    result = resp.json().get("result", [])
+    return {
+        "count": len(result),
+        "charts": [
+            {
+                "id": c.get("id"),
+                "slice_name": c.get("slice_name"),
+                "viz_type": c.get("viz_type"),
+                "datasource_id": c.get("datasource_id"),
+                "datasource_name": c.get("datasource_name_title"),
+            }
+            for c in result
+        ]
+    }
+
+
+@mcp.tool()
+def list_dashboards() -> dict[str, Any]:
+    """Lists all dashboards currently available in Apache Superset."""
+    sess = _superset_session()
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/?q=(page_size:1000)", timeout=15)
+    resp.raise_for_status()
+    result = resp.json().get("result", [])
+    return {
+        "count": len(result),
+        "dashboards": [
+            {
+                "id": d.get("id"),
+                "dashboard_title": d.get("dashboard_title"),
+                "slug": d.get("slug"),
+                "published": d.get("published"),
+            }
+            for d in result
+        ]
+    }
+
+
+@mcp.tool()
+def list_databases() -> dict[str, Any]:
+    """Lists configured databases in Apache Superset."""
+    sess = _superset_session()
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/database/?q=(page_size:100)", timeout=15)
+    resp.raise_for_status()
+    result = resp.json().get("result", [])
+    return {
+        "count": len(result),
+        "databases": [
+            {
+                "id": d.get("id"),
+                "database_name": d.get("database_name"),
+                "backend": d.get("backend"),
+            }
+            for d in result
+        ]
+    }
+
+
+@mcp.tool()
+def get_dashboard_info(dashboard_id: int) -> dict[str, Any]:
+    """Gets details for a specific dashboard by its ID."""
+    sess = _superset_session()
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/{dashboard_id}", timeout=15)
+    resp.raise_for_status()
+    result = resp.json().get("result", {})
+    return {
+        "id": result.get("id"),
+        "dashboard_title": result.get("dashboard_title"),
+        "slug": result.get("slug"),
+        "published": result.get("published"),
+        "position_json": result.get("position_json"),
+        "css": result.get("css"),
+    }
+
+
+@mcp.tool()
+def get_dataset_info(dataset_id: int) -> dict[str, Any]:
+    """Gets details for a specific dataset by its ID."""
+    sess = _superset_session()
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/dataset/{dataset_id}", timeout=15)
+    resp.raise_for_status()
+    result = resp.json().get("result", {})
+    return {
+        "id": result.get("id"),
+        "table_name": result.get("table_name"),
+        "schema": result.get("schema"),
+        "sql": result.get("sql"),
+        "columns": [
+            {"column_name": c.get("column_name"), "type": c.get("type")}
+            for c in (result.get("columns") or [])
+        ],
+    }
+
+
+@mcp.tool()
+def get_database_info(database_id: int) -> dict[str, Any]:
+    """Gets details for a specific database by its ID."""
+    sess = _superset_session()
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/database/{database_id}", timeout=15)
+    resp.raise_for_status()
+    result = resp.json().get("result", {})
+    return {
+        "id": result.get("id"),
+        "database_name": result.get("database_name"),
+        "backend": result.get("backend"),
+        "expose_in_sqllab": result.get("expose_in_sqllab"),
+    }
+
+
+@mcp.tool()
+def get_schema(schema: str = "public") -> dict[str, Any]:
+    """Lists tables inside a specific database schema (defaults to 'public')."""
+    return list_datasets(schema=schema)
+
+
+@mcp.tool()
+def get_chart_preview(chart_id: int) -> dict[str, Any]:
+    """Returns embed/preview URL metadata for a specific chart."""
+    return _chart_urls(chart_id)
+
+
+@mcp.tool()
+def get_chart_sql(chart_id: int) -> dict[str, Any]:
+    """Retrieves the generated SQL query for a specific chart."""
+    sess = _superset_session()
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=15)
+    resp.raise_for_status()
+    chart = resp.json().get("result", {})
+    datasource_id = chart.get("datasource_id")
+    params = json.loads(chart.get("params") or "{}")
+
+    payload = {
+        "datasource": {"id": datasource_id, "type": "table"},
+        "queries": [params],
+        "result_type": "query"
+    }
+    sql_resp = sess.post(f"{SUPERSET_URL}/api/v1/chart/data", json=payload, timeout=20)
+    sql_resp.raise_for_status()
+    queries = sql_resp.json().get("result", [])
+    sql_query = queries[0].get("query") if queries else None
+    return {"chart_id": chart_id, "sql": sql_query}
+
+
+@mcp.tool()
+def generate_explore_link(dataset_id: int) -> dict[str, Any]:
+    """Generates the Explore URL for a specific dataset."""
+    return {
+        "dataset_id": dataset_id,
+        "explore_url": f"{SUPERSET_PUBLIC_URL}/explore/?dataset_id={dataset_id}&dataset_type=physical",
+    }
+
+
+@mcp.tool()
+def open_sql_lab_with_context(sql: str) -> dict[str, Any]:
+    """Generates a URL to open SQL Lab with the specified query text preloaded."""
+    import urllib.parse
+    encoded_sql = urllib.parse.quote(sql)
+    return {
+        "sql": sql,
+        "sql_lab_url": f"{SUPERSET_PUBLIC_URL}/sqllab/?sql={encoded_sql}",
     }
 
 

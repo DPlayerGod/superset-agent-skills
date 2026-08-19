@@ -22,9 +22,12 @@ services:
     restart: always
     ports:
       - "8088:8088"
+    depends_on:
+      - postgres
     environment:
       SUPERSET_SECRET_KEY: "super_secret_key_987654321_abc"
       AGENT_GATEWAY_URL: http://claude_gateway:8090
+      SQLALCHEMY_DATABASE_URI: postgresql://super_user:super_pass@postgres:5432/super_db
     user: root
     # psycopg2-binary is installed at build time (superset/Dockerfile), so it is
     # deliberately NOT reinstalled here: doing that on every start made a container
@@ -40,6 +43,8 @@ services:
       "
     volumes:
       - superset_home:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+
 
   claude_gateway:
     build:
@@ -53,6 +58,11 @@ services:
       - superset
     working_dir: /app
     command: python3 gateway_server.py
+    # Superset reaches the gateway in-network at http://claude_gateway:8090; this
+    # publish exists so host-side scripts (test_ab_suite.py, benchmark.py) can hit
+    # it too. Drop it if you do not want the gateway reachable from the host.
+    ports:
+      - "8090:8090"
     environment:
       # Generate with `claude setup-token` (on a machine logged into a Claude
       # Pro/Max account via `claude login`) - this bills against that account's

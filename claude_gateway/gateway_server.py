@@ -53,26 +53,49 @@ DEADLINE_SECONDS = float(os.getenv("CLAUDE_DEADLINE_SECONDS", "150"))
 MODEL = os.getenv("CLAUDE_GATEWAY_MODEL")
 
 MCP_SERVER_NAME = "superset-postgres"
-ALLOWED_TOOLS = ",".join(
-    f"mcp__{MCP_SERVER_NAME}__{tool}"
-    for tool in (
-        "list_datasets",
-        "describe_table",
-        "run_sql_readonly",
-        "get_chart",
-        "create_dataset",
-        "create_chart",
-        "update_chart",
-        "create_dashboard",
-        "add_charts_to_dashboard",
-        "delete_chart",
-        "delete_dashboard",
-    )
+_MCP_TOOLS = (
+    "list_datasets",
+    "describe_table",
+    "run_sql_readonly",
+    "execute_sql",
+    "get_chart",
+    "create_dataset",
+    "create_virtual_dataset",
+    "create_chart",
+    "generate_chart",
+    "update_chart",
+    "create_dashboard",
+    "generate_dashboard",
+    "add_charts_to_dashboard",
+    "add_chart_to_existing_dashboard",
+    "delete_chart",
+    "delete_dashboard",
+    "health_check",
+    "get_instance_info",
+    "list_charts",
+    "list_dashboards",
+    "list_databases",
+    "get_dashboard_info",
+    "get_dataset_info",
+    "get_database_info",
+    "get_schema",
+    "get_chart_preview",
+    "get_chart_sql",
+    "generate_explore_link",
+    "open_sql_lab_with_context",
 )
+
+
+
+ALLOWED_TOOLS = ",".join(f"mcp__{MCP_SERVER_NAME}__{tool}" for tool in _MCP_TOOLS)
+
 # Explicitly deny Claude's built-in tools so the gateway can only ever reach
-# Postgres/Superset through the vetted MCP tools above, never Bash/file edits.
+# Postgres/Superset through the vetted MCP tools, never Bash/file edits.
 #
-# ALLOWED_TOOLS above is only an auto-approval list, not a boundary: under
+# ALLOWED_TOOLS is the same for both baseline and skills: 11 MCP tools. The
+# difference is in --disallowedTools: baseline denies Skill tool, skills allows it
+# (so Claude can load marketplace skills as supplements). This is only an auto-approval
+# list, not a boundary: under
 # --permission-mode dontAsk a built-in tool that appears in neither list still
 # runs. Observed on 2026-08-14 - turns called TaskCreate/TaskUpdate despite them
 # being absent from ALLOWED_TOOLS. So every built-in the gateway does not want has
@@ -92,29 +115,27 @@ ALLOWED_TOOLS = ",".join(
 # CLI costs nothing, while a missing one costs seconds. Both ToolSearch (4.2s) and
 # RemoteTrigger (3.0-5.6s) were caught this way on 2026-08-18, each spending a whole
 # round-trip before the first SQL statement ran.
-DISALLOWED_TOOLS = ",".join(
-    (
-        "Bash", "PowerShell", "Read", "Write", "Edit", "Glob", "Grep",
-        "WebFetch", "WebSearch", "NotebookEdit", "Task", "Agent",
-        "Monitor", "Workflow", "RemoteTrigger",
-        "Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-        "CronCreate", "CronDelete", "CronList", "ScheduleWakeup",
-        "SendMessage", "PushNotification", "DesignSync",
-        "EnterWorktree", "ExitWorktree",
-        "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
-        "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
-        # ToolSearch fetches schemas for deferred tools. With --strict-mcp-config
-        # there is nothing for it to find, but the model still spends a call on it:
-        # observed 2026-08-18 on "Tổng FTE hiện tại", 4.2s before the first SQL ran.
-        "ToolSearch",
-        # No --plugin-dir is ever passed (the A/B "skills" variant and its plugin
-        # were removed 2026-08-18 - see docs/ab_results.md), so there are never any
-        # skills to load. Denying it up front avoids the model reaching for it
-        # anyway and eating a failed call: measured 7.6-8.9s of dead time per turn
-        # on 2026-08-18 before this was denied unconditionally.
-        "Skill",
-    )
-)
+_BASE_DISALLOWED_TOOLS = {
+    "Bash", "PowerShell", "Read", "Write", "Edit", "Glob", "Grep",
+    "WebFetch", "WebSearch", "NotebookEdit", "Task", "Agent",
+    "Monitor", "Workflow", "RemoteTrigger",
+    "Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+    "CronCreate", "CronDelete", "CronList", "ScheduleWakeup",
+    "SendMessage", "PushNotification", "DesignSync",
+    "EnterWorktree", "ExitWorktree",
+    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
+    "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
+    "ToolSearch",
+}
+
+
+def _get_disallowed_tools(variant: str) -> str:
+    disallowed = _BASE_DISALLOWED_TOOLS.copy()
+    # baseline: deny Skill tool to avoid 7.6-8.9s dead time reaching for unavailable skills
+    # skills: allow Skill tool to load marketplace skills from .claude/settings.json
+    if variant == "baseline":
+        disallowed.add("Skill")
+    return ",".join(sorted(disallowed))
 # ReportFindings is deliberately NOT denied, and this is load-bearing rather than an
 # oversight. Denying it too - leaving the CLI with an empty built-in tool list -
 # takes the MCP tools down with it: measured 2026-08-18, 2/2 turns made no tool call
@@ -182,9 +203,14 @@ def _build_argv(prompt: str, session_id: str, resume: bool, variant: str = DEFAU
         # buffered /query path and drive the SSE /stream path.
         "--include-partial-messages",
         "--mcp-config", MCP_CONFIG_PATH,
-        "--strict-mcp-config",
+    ]
+    # baseline: strict MCP config (only predefined servers), deny Skill tool
+    # skills: allow marketplace skills from .claude/settings.json
+    if variant == "baseline":
+        argv.append("--strict-mcp-config")
+    argv += [
         "--allowedTools", ALLOWED_TOOLS,
-        "--disallowedTools", DISALLOWED_TOOLS,
+        "--disallowedTools", _get_disallowed_tools(variant),
         "--permission-mode", "dontAsk",
         "--append-system-prompt", _system_prompt(),
     ]

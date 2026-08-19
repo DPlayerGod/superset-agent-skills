@@ -22,6 +22,37 @@ from jinja2 import ChoiceLoader, FileSystemLoader
 
 AI_CHAT_DIR = "/app/pythonpath"
 AGENT_GATEWAY_URL = os.getenv("AGENT_GATEWAY_URL", "http://agent_gateway:8090")
+SQLALCHEMY_DATABASE_URI = os.getenv(
+    "SQLALCHEMY_DATABASE_URI",
+    "postgresql://super_user:super_pass@postgres:5432/super_db",
+)
+
+# Embedded Dashboard & Iframe security configuration
+ENABLE_CORS = True
+CORS_OPTIONS = {
+    "supports_credentials": True,
+    "allow_headers": ["*"],
+    "resources": ["*"],
+    "origins": ["*"],
+}
+
+FEATURE_FLAGS = {
+    "EMBEDDED_SUPERSET": True,
+    "ENABLE_TEMPLATE_PROCESSING": True,
+}
+
+TALISMAN_ENABLED = False
+TALISMAN_CONFIG = {
+    "content_security_policy": None,
+    "force_https": False,
+    "frame_options": None,
+}
+SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_SECURE = False
+HTTP_HEADERS = {}
+GUEST_ROLE_NAME = "Gamma"
+
+
 
 
 def _require_login() -> Response | None:
