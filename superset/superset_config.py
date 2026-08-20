@@ -49,8 +49,24 @@ TALISMAN_CONFIG = {
 }
 SESSION_COOKIE_SAMESITE = "Lax"
 SESSION_COOKIE_SECURE = False
-HTTP_HEADERS = {}
+HTTP_HEADERS = {"X-Frame-Options": "ALLOWALL"}
 GUEST_ROLE_NAME = "Gamma"
+
+# Custom Security Manager to allow embedded guest tokens & authenticated users to access datasources
+from superset.security import SupersetSecurityManager
+
+class CustomSecurityManager(SupersetSecurityManager):
+    def can_access_datasource(self, datasource) -> bool:
+        try:
+            from flask_login import current_user
+            if not current_user.is_anonymous:
+                return True
+        except Exception:
+            pass
+        return super().can_access_datasource(datasource)
+
+CUSTOM_SECURITY_MANAGER = CustomSecurityManager
+
 
 
 

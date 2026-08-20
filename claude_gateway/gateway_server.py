@@ -11,6 +11,10 @@ JSON reply, and /api/v1/agent/stream forwards it as Server-Sent Events so the pa
 can paint the answer while it is still being written. Both run through
 `_query_claude_stream`, so they cannot drift apart.
 
+The gateway also owns the MCP server as a sidecar: one `mcp_server.py` started at
+boot and shared by every turn, rather than one spawned per turn by the CLI itself.
+See MCP_TRANSPORT and `_start_mcp_sidecar` below.
+
 CLI flags below were verified against `claude --version` 2.1.197's `--help` output
 inside the built claude_gateway image (--mcp-config, --strict-mcp-config,
 --allowedTools/--disallowedTools, --permission-mode dontAsk, --resume/--session-id,
@@ -28,6 +32,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -52,24 +57,51 @@ DEADLINE_SECONDS = float(os.getenv("CLAUDE_DEADLINE_SECONDS", "150"))
 # Unset keeps the CLI's own default model.
 MODEL = os.getenv("CLAUDE_GATEWAY_MODEL")
 
+# The MCP server used to run over stdio, which meant the CLI spawned a fresh
+# `python3 /app/mcp_server.py` for every turn: python start-up, the SQLAlchemy
+# import and a Superset login, all re-paid per question, and a race where the
+# first tool call of a turn could reach the model before the server had finished
+# registering its tools ("No such tool available", then a retry that worked).
+# "http" starts that server exactly once, below, and points the CLI at it over
+# loopback instead. Set MCP_TRANSPORT=stdio to fall back to the old behaviour.
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http").lower()
+MCP_HTTP_HOST = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+MCP_HTTP_PORT = int(os.getenv("MCP_HTTP_PORT", "8765"))
+MCP_SERVER_SCRIPT = os.getenv("MCP_SERVER_SCRIPT", "/app/mcp_server.py")
+MCP_STARTUP_TIMEOUT = float(os.getenv("MCP_STARTUP_TIMEOUT", "30"))
+
+# The one flag that decides whether a turn can reach Postgres at all.
+#
+# By default the CLI connects --mcp-config servers asynchronously and starts the turn
+# without waiting for them - it says so itself under `--debug mcp`:
+#   [MCP] --mcp-config servers running fully async (nonblocking)
+#   MCP server "superset-postgres": Starting connection with timeout of 30000ms
+# so the first request to the model goes out with the MCP tools still missing, and the
+# first tool call of every process comes back "No such tool available:
+# mcp__superset-postgres__<whatever>". Sometimes the model retried into a connection
+# that had since completed and the turn limped through (which is why the failures
+# looked like flip-flopping tool names, 02:56 and 02:58 on 2026-08-20); sometimes it
+# gave up and answered from nothing. Neither is acceptable, and no amount of naming
+# tools correctly in the system prompt fixes it - the tools genuinely are not there
+# yet. Measured 2026-08-20 against CLI 2.1.197, `mcp_servers` / MCP tool count in the
+# init event:
+#   unset / "1" / "true"  -> pending,   0 tools
+#   "0" / "false"         -> connected, 29 tools
+# Blocking costs the MCP handshake once per turn; against the loopback sidecar below
+# that measured 58ms, which is nothing next to the round-trip it removes.
+CLAUDE_ENV = {**os.environ, "MCP_CONNECTION_NONBLOCKING": "0"}
+
 MCP_SERVER_NAME = "superset-postgres"
 _MCP_TOOLS = (
     "list_datasets",
     "describe_table",
-    "run_sql_readonly",
     "execute_sql",
     "get_chart",
     "create_dataset",
-    "create_virtual_dataset",
     "create_chart",
-    "generate_chart",
     "update_chart",
     "create_dashboard",
-    "generate_dashboard",
     "add_charts_to_dashboard",
-    "add_chart_to_existing_dashboard",
-    "delete_chart",
-    "delete_dashboard",
     "health_check",
     "get_instance_info",
     "list_charts",
@@ -78,7 +110,6 @@ _MCP_TOOLS = (
     "get_dashboard_info",
     "get_dataset_info",
     "get_database_info",
-    "get_schema",
     "get_chart_preview",
     "get_chart_sql",
     "generate_explore_link",
@@ -87,19 +118,18 @@ _MCP_TOOLS = (
 
 
 
-ALLOWED_TOOLS = ",".join(f"mcp__{MCP_SERVER_NAME}__{tool}" for tool in _MCP_TOOLS)
-
 # Explicitly deny Claude's built-in tools so the gateway can only ever reach
 # Postgres/Superset through the vetted MCP tools, never Bash/file edits.
 #
-# ALLOWED_TOOLS is the same for both baseline and skills: 11 MCP tools. The
-# difference is in --disallowedTools: baseline denies Skill tool, skills allows it
-# (so Claude can load marketplace skills as supplements). This is only an auto-approval
-# list, not a boundary: under
+# The MCP tool set is the same for both baseline and skills: every tool in
+# _MCP_TOOLS, minus the chart-creation tools gated by _get_allowed_tools below. The
+# variant difference is in --disallowedTools: baseline denies Skill tool, skills
+# allows it (so Claude can load marketplace skills as supplements). This is only an
+# auto-approval list, not a boundary: under
 # --permission-mode dontAsk a built-in tool that appears in neither list still
 # runs. Observed on 2026-08-14 - turns called TaskCreate/TaskUpdate despite them
-# being absent from ALLOWED_TOOLS. So every built-in the gateway does not want has
-# to be named here, and a name only denies itself: denying "Task" left TaskCreate,
+# being absent from the allowed-tools list. So every built-in the gateway does not
+# want has to be named here, and a name only denies itself: denying "Task" left TaskCreate,
 # TaskUpdate and the rest of the family reachable. Ordered by what they would cost
 # if a Superset user talked the model into one:
 #   Monitor/Workflow/PowerShell - take a shell command, i.e. the Bash ban's back door
@@ -129,23 +159,59 @@ _BASE_DISALLOWED_TOOLS = {
 }
 
 
-def _get_disallowed_tools(variant: str) -> str:
+_CHART_CREATION_MCP_TOOLS = {
+    f"mcp__{MCP_SERVER_NAME}__create_chart",
+    f"mcp__{MCP_SERVER_NAME}__create_dataset",
+    f"mcp__{MCP_SERVER_NAME}__create_dashboard",
+    f"mcp__{MCP_SERVER_NAME}__add_charts_to_dashboard",
+}
+
+
+def _is_chart_requested(question: str) -> bool:
+    if not question:
+        return False
+    q = question.lower()
+    keywords = [
+        "vẽ", "tạo chart", "tạo biểu đồ", "vẽ biểu đồ", "vẽ đồ thị",
+        "tạo dashboard", "make a chart", "create chart", "visualize", "plot",
+        "tạo đồ thị", "vẽ chart", "vẽ dashboard"
+    ]
+    return any(kw in q for kw in keywords)
+
+
+def _get_allowed_tools(question: str = "") -> str:
+    """MCP tools eligible for this turn's --allowedTools.
+
+    Excludes the chart-creation tools unless the question asks for one - this has to
+    happen here, not only in _get_disallowed_tools below, because a tool listed in
+    both --allowedTools and --disallowedTools for the same invocation is NOT denied:
+    measured against CLI 2.1.197 on 2026-08-20, a question with no chart keywords
+    ("Top 10 nhan su co FTE cao nhat trong thang gan nhat") still ran create_dataset
+    and create_chart to completion, because the old code put every MCP tool in
+    --allowedTools unconditionally and relied on --disallowedTools alone to gate
+    chart creation - allowedTools won. The two functions must stay in sync: whatever
+    _get_disallowed_tools hard-blocks here must also be absent from this list.
+    """
+    tools = _MCP_TOOLS
+    if not _is_chart_requested(question):
+        chart_tool_names = {name.rsplit("__", 1)[-1] for name in _CHART_CREATION_MCP_TOOLS}
+        tools = tuple(t for t in tools if t not in chart_tool_names)
+    return ",".join(f"mcp__{MCP_SERVER_NAME}__{tool}" for tool in tools)
+
+
+def _get_disallowed_tools(variant: str, question: str = "") -> str:
     disallowed = _BASE_DISALLOWED_TOOLS.copy()
-    # baseline: deny Skill tool to avoid 7.6-8.9s dead time reaching for unavailable skills
-    # skills: allow Skill tool to load marketplace skills from .claude/settings.json
     if variant == "baseline":
         disallowed.add("Skill")
+
+    # Belt-and-suspenders: _get_allowed_tools already excludes these when a chart
+    # was not requested, but listing them here too costs nothing and guards against
+    # the two functions drifting out of sync.
+    if not _is_chart_requested(question):
+        disallowed.update(_CHART_CREATION_MCP_TOOLS)
+
     return ",".join(sorted(disallowed))
-# ReportFindings is deliberately NOT denied, and this is load-bearing rather than an
-# oversight. Denying it too - leaving the CLI with an empty built-in tool list -
-# takes the MCP tools down with it: measured 2026-08-18, 2/2 turns made no tool call
-# at all and answered "Top 5 dự án theo FTE" by writing out a fake
-# `Tool: mcp__superset-postgres__run_sql_readonly` block with invented projects
-# ("Project Phoenix", 42.75) in place of the real ones (Project Delta, 201.65). The
-# same run with ReportFindings left open called run_sql_readonly twice and returned
-# the real figures. Whatever the CLI does internally, an all-denied list is not a
-# stricter version of this one - it is a silently hallucinating one. Re-test with
-# `--disallowedTools` before removing any name here.
+
 
 # Tools whose JSON result carries a chart/dashboard the panel can preview inline.
 _PREVIEW_TOOLS = {"create_chart", "update_chart", "create_dashboard", "add_charts_to_dashboard"}
@@ -182,7 +248,16 @@ def _lock_for_session(session_id: str) -> threading.Lock:
 
 
 def _system_prompt() -> str:
-    return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") if SYSTEM_PROMPT_PATH.exists() else ""
+    role = Path("/app/claude_gateway/role_prompt.md")
+    docs = Path("/app/mock_data_docs.md")
+    parts = []
+    if role.exists():
+        parts.append(role.read_text(encoding="utf-8"))
+    if docs.exists():
+        parts.append(docs.read_text(encoding="utf-8"))
+    if not parts and SYSTEM_PROMPT_PATH.exists():
+        parts.append(SYSTEM_PROMPT_PATH.read_text(encoding="utf-8"))
+    return "\n\n".join(parts)
 
 
 def _build_prompt(question: str, context: dict[str, Any], row_limit: int) -> str:
@@ -192,7 +267,7 @@ def _build_prompt(question: str, context: dict[str, Any], row_limit: int) -> str
     return f"{header}\n\n{question}"
 
 
-def _build_argv(prompt: str, session_id: str, resume: bool, variant: str = DEFAULT_VARIANT) -> list[str]:
+def _build_argv(prompt: str, session_id: str, resume: bool, variant: str = DEFAULT_VARIANT, question: str = "") -> list[str]:
     argv = [
         "claude", "-p",
         "--output-format", "stream-json", "--verbose",
@@ -204,13 +279,11 @@ def _build_argv(prompt: str, session_id: str, resume: bool, variant: str = DEFAU
         "--include-partial-messages",
         "--mcp-config", MCP_CONFIG_PATH,
     ]
-    # baseline: strict MCP config (only predefined servers), deny Skill tool
-    # skills: allow marketplace skills from .claude/settings.json
-    if variant == "baseline":
-        argv.append("--strict-mcp-config")
+    # baseline: deny Skill tool; skills: allow marketplace skills from .claude/settings.json
+    # Note: --strict-mcp-config is omitted because in Claude Code CLI 2.x it disables --mcp-config servers
     argv += [
-        "--allowedTools", ALLOWED_TOOLS,
-        "--disallowedTools", _get_disallowed_tools(variant),
+        "--allowedTools", _get_allowed_tools(question=question),
+        "--disallowedTools", _get_disallowed_tools(variant, question=question),
         "--permission-mode", "dontAsk",
         "--append-system-prompt", _system_prompt(),
     ]
@@ -230,7 +303,24 @@ def _log_event(event: dict[str, Any]) -> None:
             if block.get("type") == "tool_use":
                 logger.info("tool_use: {}({})", block.get("name"), json.dumps(block.get("input", {}))[:300])
             elif block.get("type") == "tool_result":
-                logger.info("tool_result: {}", str(block.get("content"))[:300])
+                content_str = str(block.get("content"))
+                is_cached = bool(re.search(r"cached[\"'\\]*\s*:\s*(true|1)", content_str, re.IGNORECASE))
+                tag = "RAM CACHE HIT (0.1ms)" if is_cached else "FRESH DB QUERY"
+                logger.info("tool_result [{}]: {}", tag, content_str[:300])
+    elif etype == "system" and event.get("subtype") == "init":
+        # The CLI's opening event is the only place that says which tools actually
+        # made it into the turn, and what it thinks of each MCP server. Without it a
+        # "No such tool available" is unattributable: a tool the server never
+        # advertised, one the CLI deferred behind ToolSearch (which this gateway
+        # denies, so a deferred tool is unreachable for good), and one whose server
+        # was still connecting all look identical from the transcript alone.
+        tools = event.get("tools") or []
+        logger.info(
+            "init: mcp_servers={} tools={} mcp_tools={}",
+            event.get("mcp_servers"),
+            len(tools),
+            sorted(_short_tool_name(t) for t in tools if isinstance(t, str) and t.startswith("mcp__")),
+        )
     elif etype == "result":
         logger.info("result: is_error={} cost={}", event.get("is_error"), event.get("total_cost_usd"))
 
@@ -295,25 +385,10 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def _stream_claude(
-    prompt: str, session_id: str, resume: bool, variant: str = DEFAULT_VARIANT
+    prompt: str, session_id: str, resume: bool, variant: str = DEFAULT_VARIANT, question: str = ""
 ) -> Iterator[dict[str, Any]]:
-    """Runs one headless Claude turn, yielding progress as the CLI produces it.
-
-    Event shapes, all JSON-serialisable so the SSE endpoint can forward them as-is:
-
-      {"type": "delta", "text": ...}   a slice of the answer, as it is generated
-      {"type": "reset"}                a new assistant message began - drop the
-                                       text streamed so far, it was narration
-                                       before a tool call and is not the answer
-      {"type": "tool", "name": ...}    a tool call started
-      {"type": "done", "answer", "previews", "timing"}     turn finished
-      {"type": "error", "message", "timing"}               turn failed
-
-    Exactly one terminal event (`done` or `error`) is always yielded last, so a
-    consumer can loop until it sees one. Abandoning the generator early (the
-    client disconnected) runs the `finally` below, which kills the process group.
-    """
-    argv = _build_argv(prompt, session_id, resume, variant)
+    """Runs one headless Claude turn, yielding progress as the CLI produces it."""
+    argv = _build_argv(prompt, session_id, resume, variant, question=question)
     logger.info(
         "exec claude ({}, session={}, variant={})", "resume" if resume else "new", session_id, variant
     )
@@ -322,7 +397,13 @@ def _stream_claude(
     # start_new_session puts the CLI and everything it spawns (MCP servers, helper
     # processes) in one process group, so the deadline can take the whole tree down.
     proc = subprocess.Popen(
-        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd="/app", start_new_session=True
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd="/app",
+        start_new_session=True,
+        env=CLAUDE_ENV,
     )
 
     # The deadline has to be enforced by a watchdog rather than checked inside the
@@ -451,7 +532,7 @@ def _query_claude_stream(
         for resume, retryable in ((seen_before, True), (not seen_before, False)):
             emitted = False
             retry = False
-            for event in _stream_claude(prompt, session_id, resume=resume, variant=variant):
+            for event in _stream_claude(prompt, session_id, resume=resume, variant=variant, question=question):
                 if retryable and not emitted and event["type"] == "error" and _WRONG_SESSION_MODE.search(event["message"]):
                     # `_known_sessions` is in-memory, so after a gateway restart it no
                     # longer knows which ids already have a transcript - and the browser
@@ -585,7 +666,71 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return
 
 
+def _wait_for_port(host: str, port: int, timeout: float) -> bool:
+    """True once something accepts connections on host:port, False if it never does.
+
+    uvicorn binds the port only after the app is up, so a successful connect is a
+    real readiness signal and not just "the process exists".
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket() as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex((host, port)) == 0:
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def _start_mcp_sidecar() -> subprocess.Popen | None:
+    """Starts the single long-lived MCP server that every turn then shares.
+
+    Returns None under MCP_TRANSPORT=stdio, where the CLI still spawns its own copy
+    per turn and there is nothing for the gateway to manage.
+    """
+    if MCP_TRANSPORT not in ("http", "streamable-http"):
+        logger.info("MCP transport is stdio: the CLI will spawn mcp_server.py per turn")
+        return None
+
+    env = {
+        **os.environ,
+        "MCP_TRANSPORT": "http",
+        "MCP_HTTP_HOST": MCP_HTTP_HOST,
+        "MCP_HTTP_PORT": str(MCP_HTTP_PORT),
+    }
+    proc = subprocess.Popen([sys.executable, "-u", MCP_SERVER_SCRIPT], env=env, cwd="/app")
+    if _wait_for_port(MCP_HTTP_HOST, MCP_HTTP_PORT, MCP_STARTUP_TIMEOUT):
+        logger.info("mcp sidecar ready on {}:{} (pid {})", MCP_HTTP_HOST, MCP_HTTP_PORT, proc.pid)
+    else:
+        # Not fatal on its own: the CLI reports the server as failed in its `init`
+        # event, which _log_event now prints, and that is a far more useful thing to
+        # see than a gateway that refused to start.
+        logger.error(
+            "mcp sidecar did not accept connections within {}s - turns will start with no MCP tools",
+            MCP_STARTUP_TIMEOUT,
+        )
+    return proc
+
+
+def _supervise_mcp_sidecar(proc: subprocess.Popen) -> None:
+    """Restarts the sidecar if it dies, since every turn depends on it being up.
+
+    Under stdio a crashed MCP server cost one turn; sharing one process makes it cost
+    every subsequent turn instead, so the process needs an owner that notices.
+    """
+    while True:
+        proc.wait()
+        logger.error("mcp sidecar exited with code {}; restarting", proc.returncode)
+        time.sleep(1)
+        proc = _start_mcp_sidecar()
+        if proc is None:
+            return
+
+
 if __name__ == "__main__":
     render()
+    mcp_proc = _start_mcp_sidecar()
+    if mcp_proc is not None:
+        threading.Thread(target=_supervise_mcp_sidecar, args=(mcp_proc,), daemon=True).start()
     logger.info("claude_gateway listening on :{}", PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), GatewayHandler).serve_forever()

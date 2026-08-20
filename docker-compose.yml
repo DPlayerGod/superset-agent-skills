@@ -81,6 +81,12 @@ services:
       SUPERSET_ADMIN_USERNAME: admin
       SUPERSET_ADMIN_PASSWORD: admin
       CLAUDE_GATEWAY_PORT: 8090
+      # "http" keeps one long-lived mcp_server.py that the gateway starts at boot and
+      # every turn shares over loopback. "stdio" is the old behaviour, where the CLI
+      # spawns a fresh MCP server (python start-up + Superset login) for every single
+      # question - keep it only as a rollback.
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-http}
+      MCP_HTTP_PORT: 8765
       # Alias ("sonnet", "opus", "fable") or full model name
       # ("claude-haiku-4-5-20251001"). Leave unset to use the CLI's own default.
       CLAUDE_GATEWAY_MODEL: ${CLAUDE_GATEWAY_MODEL:-}

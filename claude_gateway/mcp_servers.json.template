@@ -4,6 +4,7 @@
       "command": "python3",
       "args": ["-u", "/app/mcp_server.py"],
       "env": {
+        "MCP_TRANSPORT": "stdio",
         "DATABASE_URL": "${DATABASE_URL}",
         "MCP_MAX_ROWS": "${MCP_MAX_ROWS}",
         "SUPERSET_URL": "${SUPERSET_URL}",

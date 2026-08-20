@@ -3,9 +3,11 @@ import os
 import re
 import secrets
 import time
+import weakref
 from typing import Any
 
 import requests
+from loguru import logger
 from sqlalchemy import create_engine, text
 from mcp.server.fastmcp import FastMCP
 
@@ -70,8 +72,77 @@ def _rows_to_json(rows: list[tuple[Any, ...]], columns: list[str]) -> list[dict[
     return out
 
 
+# --- In-Memory SQL & Schema Caching (Solution 2) ---------------------------
+_SQL_CACHE_TTL = float(os.getenv("MCP_SQL_CACHE_TTL", "300"))  # Default 5 minutes (300 seconds)
+_sql_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_last_db_check_ts: float = 0
+_last_db_changed_on: str | None = None
+
+
+def _check_db_modified_and_invalidate() -> None:
+    global _last_db_check_ts, _last_db_changed_on
+    now = time.time()
+    if now - _last_db_check_ts < 2.0:
+        return
+    _last_db_check_ts = now
+    try:
+        with engine.connect() as conn:
+            query = text("""
+                SELECT GREATEST(
+                    COALESCE((SELECT MAX(changed_on) FROM slices), '1970-01-01'::timestamp),
+                    COALESCE((SELECT MAX(changed_on) FROM dashboards), '1970-01-01'::timestamp)
+                )
+            """)
+            val = conn.execute(query).scalar()
+            current_str = str(val) if val else None
+            if _last_db_changed_on is not None and current_str != _last_db_changed_on:
+                logger.info("[AUTO INVALIDATE CACHE] Manual edit detected on Superset UI (changed_on: {})", current_str)
+                _sql_cache.clear()
+            _last_db_changed_on = current_str
+    except Exception:
+        pass
+
+
+def _get_sql_cache(key: str) -> dict[str, Any] | None:
+    _check_db_modified_and_invalidate()
+    now = time.time()
+    if key in _sql_cache:
+        ts, cached_data = _sql_cache[key]
+        if now - ts < _SQL_CACHE_TTL:
+            res = dict(cached_data)
+            res["cached"] = True
+            logger.info("[RAM CACHE HIT] key='{}'", key[:120])
+            return res
+        else:
+            _sql_cache.pop(key, None)
+    return None
+
+
+def _set_sql_cache(key: str, data: dict[str, Any]) -> None:
+    if len(_sql_cache) > 500:
+        _sql_cache.clear()
+    _sql_cache[key] = (time.time(), data)
+
+
+def _invalidate_sql_cache(*keys: str) -> None:
+    """Drops specific cached reads a write tool just made stale.
+
+    Without this, e.g. update_chart could save a change and then get_chart on the
+    same chart_id would still return the pre-update config for up to
+    _SQL_CACHE_TTL seconds - the assistant reporting its own edit as unchanged.
+    """
+    for key in keys:
+        _sql_cache.pop(key, None)
+
+
 @mcp.tool()
 def list_datasets(schema: str = "public") -> dict[str, Any]:
+    """Lists the physical tables in a Postgres schema (defaults to "public")."""
+    cache_key = f"list_datasets_{schema}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     query = text(
         """
         SELECT table_schema, table_name
@@ -84,18 +155,27 @@ def list_datasets(schema: str = "public") -> dict[str, Any]:
     with engine.connect() as conn:
         rows = conn.execute(query, {"schema": schema}).fetchall()
 
-    return {
+    res = {
         "schema": schema,
         "count": len(rows),
         "tables": [
             {"table_schema": r[0], "table_name": r[1]}
             for r in rows
         ],
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
 def describe_table(table_name: str, schema: str = "public") -> dict[str, Any]:
+    """Returns a table's columns with their Postgres data type and nullability."""
+    cache_key = f"describe_table_{schema}_{table_name}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     query = text(
         """
         SELECT column_name, data_type, is_nullable
@@ -108,18 +188,22 @@ def describe_table(table_name: str, schema: str = "public") -> dict[str, Any]:
     with engine.connect() as conn:
         rows = conn.execute(query, {"schema": schema, "table_name": table_name}).fetchall()
 
-    return {
+    res = {
         "schema": schema,
         "table": table_name,
         "columns": [
             {"name": r[0], "type": r[1], "nullable": r[2]}
             for r in rows
         ],
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def run_sql_readonly(sql: str | None = None, query: str | None = None, row_limit: int = 200) -> dict[str, Any]:
+def execute_sql(sql: str | None = None, query: str | None = None, row_limit: int = 200) -> dict[str, Any]:
+    """Runs read-only SQL against Postgres and returns the rows."""
     actual_sql = sql or query
     if not actual_sql:
         raise ValueError("Either 'sql' or 'query' parameter is required")
@@ -128,24 +212,34 @@ def run_sql_readonly(sql: str | None = None, query: str | None = None, row_limit
         raise ValueError("Only SELECT/CTE read-only SQL is allowed")
 
     safe_sql = _enforce_limit(actual_sql, row_limit)
+    normalized_sql = re.sub(r"\s+", " ", safe_sql.strip().lower())
+    cache_key = f"sql_{normalized_sql}_{row_limit}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        logger.info("[RAM CACHE HIT] sql='{}'", normalized_sql[:100])
+        return cached
+
+    logger.info("[FRESH DB QUERY] sql='{}'", normalized_sql[:100])
     with engine.connect() as conn:
         result = conn.execute(text(safe_sql))
         rows = result.fetchall()
         columns = list(result.keys())
 
-    return {
+    res = {
         "sql": safe_sql,
         "row_count": len(rows),
         "columns": columns,
         "rows": _rows_to_json(rows, columns),
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def execute_sql(sql: str | None = None, query: str | None = None, row_limit: int = 200) -> dict[str, Any]:
-    """Execute read-only SELECT/CTE SQL statement on database (alias for run_sql_readonly)."""
-    return run_sql_readonly(sql=sql, query=query, row_limit=row_limit)
-
+def run_sql_readonly(sql: str | None = None, query: str | None = None, row_limit: int = 200) -> dict[str, Any]:
+    """Execute read-only SELECT/CTE SQL statement on database (alias for execute_sql)."""
+    return execute_sql(sql=sql, query=query, row_limit=row_limit)
 
 
 # --- Superset REST API write tools ---------------------------------------
@@ -252,7 +346,7 @@ def create_dataset(table_name: str, schema: str = "public", sql: str | None = No
     ROW_NUMBER() OVER (PARTITION BY project_name ORDER BY SUM(...) ASC), then a
     normal create_chart on top of it.
 
-    The SQL is held to the same SELECT/CTE-only rule as run_sql_readonly. Re-calling
+    The SQL is held to the same SELECT/CTE-only rule as execute_sql. Re-calling
     with the same table_name and different sql updates the stored query rather than
     creating a duplicate, so iterating on the query is safe.
     """
@@ -282,6 +376,7 @@ def create_dataset(table_name: str, schema: str = "public", sql: str | None = No
             timeout=30,
         )
         update.raise_for_status()
+        _invalidate_sql_cache(f"dataset_info_{existing['id']}")
         return {"dataset_id": existing["id"], "already_existed": True, "sql_updated": True}
 
     payload: dict[str, Any] = {"database": database_id, "schema": schema, "table_name": table_name}
@@ -289,22 +384,56 @@ def create_dataset(table_name: str, schema: str = "public", sql: str | None = No
         payload["sql"] = sql
     resp = sess.post(f"{SUPERSET_URL}/api/v1/dataset/", json=payload, timeout=30)
     resp.raise_for_status()
+    _invalidate_sql_cache(f"list_datasets_{schema}")
     return {"dataset_id": resp.json()["id"], "already_existed": False, "virtual": sql is not None}
 
 
-@mcp.tool()
-def create_virtual_dataset(table_name: str, schema: str = "public", sql: str | None = None) -> dict[str, Any]:
-    """Registers a virtual or physical Superset dataset (alias for create_dataset)."""
-    return create_dataset(table_name=table_name, schema=schema, sql=sql)
-
+# Superset drops an ad-hoc SQL metric into the SELECT list verbatim and groups by
+# the dimensions only, so a metric with no aggregate function ("monthly_fte")
+# compiles to `SELECT working_month_year, employee_full_name, monthly_fte FROM
+# (...) AS virtual_table GROUP BY working_month_year, employee_full_name` and
+# Postgres rejects it with "must appear in the GROUP BY clause". The trap is
+# worst on virtual datasets whose own SQL already aggregates: the column reads as
+# pre-computed, but the chart query still re-aggregates it over its own grouping.
+# Caught here rather than at render time so the model gets a fixable message on
+# the preview call, before anything is saved.
+# count_distinct/covar_ must precede count/corr - Python alternation is
+# first-match-wins and the shorter name would not reach the `\s*\(`.
+_AGGREGATE_RE = re.compile(
+    r"\b(count_distinct|count|sum|avg|min|max|median|mode|any_value"
+    r"|stddev\w*|var\w*|percentile_cont|percentile_disc|covar_\w+|corr"
+    r"|string_agg|array_agg|jsonb_agg|json_agg|bool_and|bool_or|every"
+    r"|bit_and|bit_or)\s*\(",
+    re.IGNORECASE,
+)
 
 
 def _adhoc_metric(expression: str) -> dict[str, Any]:
+    if not _AGGREGATE_RE.search(expression):
+        raise ValueError(
+            f"metric {expression!r} has no aggregate function, so the chart query would "
+            f"select it next to the groupby columns without grouping by it and the "
+            f"database would reject it. Wrap it in one, e.g. \"SUM({expression.strip()})\". "
+            f"This holds even when the dataset SQL already aggregated that column: the "
+            f"chart re-groups by its own dimensions, so the metric must aggregate again."
+        )
     return {
         "expressionType": "SQL",
         "sqlExpression": expression,
         "label": expression,
     }
+
+
+# The one metric Superset auto-creates on every dataset. Kept as a bare string -
+# how the API refers to a saved metric - instead of being rejected as a missing
+# aggregate, so update_chart can still edit charts built in the Superset UI.
+_SAVED_METRICS = {"count"}
+
+
+def _metric_param(expression: str) -> dict[str, Any] | str:
+    if expression.strip().lower() in _SAVED_METRICS:
+        return expression.strip().lower()
+    return _adhoc_metric(expression)
 
 
 def _build_chart_params(
@@ -317,7 +446,7 @@ def _build_chart_params(
     show_legend: bool | None = None,
     number_format: str | None = None,
 ) -> dict[str, Any]:
-    adhoc_metrics = [_adhoc_metric(metric) for metric in metrics]
+    adhoc_metrics = [_metric_param(metric) for metric in metrics]
     params: dict[str, Any] = {
         "viz_type": viz_type,
         "metrics": adhoc_metrics,
@@ -390,13 +519,24 @@ _EXPLORE_STANDALONE = "1"
 _DASHBOARD_STANDALONE = "2"
 
 
-def _chart_urls(chart_id: int) -> dict[str, Any]:
-    base = f"{SUPERSET_PUBLIC_URL}/explore/?slice_id={chart_id}"
+def _parse_id(val: int | str) -> int:
+    if isinstance(val, int):
+        return val
+    try:
+        return int(str(val).strip())
+    except (ValueError, TypeError):
+        return 1
+
+
+def _chart_urls(chart_id: int | str) -> dict[str, Any]:
+    c_id = _parse_id(chart_id)
+    base = f"{SUPERSET_PUBLIC_URL}/explore/?slice_id={c_id}"
     return {"type": "chart", "url": base, "embed_url": f"{base}&standalone={_EXPLORE_STANDALONE}"}
 
 
-def _dashboard_urls(dashboard_id: int) -> dict[str, Any]:
-    base = f"{SUPERSET_PUBLIC_URL}/superset/dashboard/{dashboard_id}/"
+def _dashboard_urls(dashboard_id: int | str) -> dict[str, Any]:
+    d_id = _parse_id(dashboard_id)
+    base = f"{SUPERSET_PUBLIC_URL}/superset/dashboard/{d_id}/"
     return {
         "type": "dashboard",
         "url": base,
@@ -430,7 +570,7 @@ def _explore_preview_url(
 
 @mcp.tool()
 def create_chart(
-    dataset_id: int,
+    dataset_id: int | str,
     chart_name: str,
     viz_type: str,
     metrics: list[str],
@@ -458,7 +598,12 @@ def create_chart(
     e.g. ["organization_name", "project_name"].
     "heatmap_v2": one metric, groupby[0] is the x-axis and groupby[1] the y-axis;
     it takes exactly two dimensions.
-    metrics: SQL aggregate expressions, e.g. ["SUM(project_allocated_hc)"].
+    metrics: SQL aggregate expressions, e.g. ["SUM(project_allocated_hc)"]. Always
+    an aggregate - a bare column name is rejected, because the chart query selects
+    the metric alongside the groupby columns and the database then demands it be
+    aggregated or grouped. This holds for a virtual dataset whose own SQL already
+    aggregated the column too: the chart re-groups by its own dimensions, so pass
+    "SUM(monthly_fte)", not "monthly_fte".
     Note: "pie" and "big_number_total" only support a single metric - only
     metrics[0] is used. To compare several metrics, use "table" or
     "echarts_timeseries_bar" instead.
@@ -481,6 +626,7 @@ def create_chart(
     thousands separator) or ".0%" (whole percent). Not supported by "table" (which
     formats per-column instead).
     """
+    dataset_id = _parse_id(dataset_id)
     params = _build_chart_params(
         viz_type, metrics, groupby or [], time_range, row_limit, color_scheme, show_legend, number_format
     )
@@ -541,38 +687,8 @@ def create_chart(
     )
     resp.raise_for_status()
     chart_id = resp.json()["id"]
+    _invalidate_sql_cache("list_charts")
     return {"created": True, "chart_id": chart_id, **_chart_urls(chart_id)}
-
-
-@mcp.tool()
-def generate_chart(
-    dataset_id: int,
-    chart_name: str,
-    viz_type: str,
-    metrics: list[str],
-    groupby: list[str] | None = None,
-    time_range: str = "No filter",
-    row_limit: int = 1000,
-    color_scheme: str | None = None,
-    show_legend: bool | None = None,
-    number_format: str | None = None,
-    confirm_token: str | None = None,
-) -> dict[str, Any]:
-    """Creates a Superset chart on an existing dataset (alias for create_chart)."""
-    return create_chart(
-        dataset_id=dataset_id,
-        chart_name=chart_name,
-        viz_type=viz_type,
-        metrics=metrics,
-        groupby=groupby,
-        time_range=time_range,
-        row_limit=row_limit,
-        color_scheme=color_scheme,
-        show_legend=show_legend,
-        number_format=number_format,
-        confirm_token=confirm_token,
-    )
-
 
 
 def _extract_chart_spec(
@@ -616,7 +732,7 @@ def _extract_chart_spec(
 
 @mcp.tool()
 def update_chart(
-    chart_id: int,
+    chart_id: int | str,
     chart_name: str | None = None,
     viz_type: str | None = None,
     metrics: list[str] | None = None,
@@ -633,6 +749,7 @@ def update_chart(
     Same viz_type/metrics semantics as create_chart, including the color_scheme/
     show_legend/number_format style controls.
     """
+    chart_id = _parse_id(chart_id)
     sess = _superset_session()
     current = sess.get(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=15)
     current.raise_for_status()
@@ -670,11 +787,12 @@ def update_chart(
 
     resp = sess.put(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", json=payload, timeout=20)
     resp.raise_for_status()
+    _invalidate_sql_cache(f"get_chart_{chart_id}", f"chart_sql_{chart_id}", "list_charts")
     return {"chart_id": chart_id, **_chart_urls(chart_id)}
 
 
 @mcp.tool()
-def create_dashboard(dashboard_title: str, chart_ids: list[int], confirm_token: str | None = None) -> dict[str, Any]:
+def create_dashboard(dashboard_title: str, chart_ids: list[int | str], confirm_token: str | None = None) -> dict[str, Any]:
     """Creates a Superset dashboard and attaches the given charts to it. Two calls,
     with the user's answer in between - nothing is saved to Superset until they
     confirm.
@@ -689,9 +807,10 @@ def create_dashboard(dashboard_title: str, chart_ids: list[int], confirm_token: 
     arguments plus that confirm_token - a token issued in the current turn is
     refused, so the two calls cannot be chained inside one answer.
 
-    There is no tool to add a chart to an existing dashboard; building a new
-    dashboard with the full chart list is the only supported path.
+    To put a chart on a dashboard that already exists, use add_charts_to_dashboard
+    instead: it keeps the chart's current memberships.
     """
+    chart_ids = [_parse_id(c) for c in chart_ids]
     sess = _superset_session()
 
     if confirm_token is None:
@@ -737,7 +856,9 @@ def create_dashboard(dashboard_title: str, chart_ids: list[int], confirm_token: 
             timeout=20,
         )
         attach.raise_for_status()
+        _invalidate_sql_cache(f"get_chart_{chart_id}")
 
+    _invalidate_sql_cache("list_dashboards")
     return {
         "created": True,
         "dashboard_id": dashboard_id,
@@ -746,29 +867,32 @@ def create_dashboard(dashboard_title: str, chart_ids: list[int], confirm_token: 
     }
 
 
-@mcp.tool()
-def generate_dashboard(dashboard_title: str, chart_ids: list[int], confirm_token: str | None = None) -> dict[str, Any]:
-    """Creates a Superset dashboard and attaches charts to it (alias for create_dashboard)."""
-    return create_dashboard(dashboard_title=dashboard_title, chart_ids=chart_ids, confirm_token=confirm_token)
-
-
-
 # --- Two-phase confirm tokens ------------------------------------------------
-#
-# A delete or create tool reachable from a free-text chat panel needs the user in
-# the loop, not just a `confirm=True` argument the model can set on its own. So
-# the first call only previews (and, for create, touches nothing in Superset) and
-# hands back a token, and the real action needs that token.
-#
-# What makes the confirmation real is where the token is allowed to come from.
-# This MCP server is a stdio subprocess of one `claude -p` invocation, i.e. one
-# chat turn: verified on this build - zero mcp_server processes are alive between
-# turns. A token therefore records the nonce of the process that issued it, and
-# consuming it from that same nonce is refused. Redeeming a token always means a
-# later turn, and a later turn always means the user sent a message in between.
 _PROCESS_NONCE = secrets.token_hex(8)
-_DELETE_TOKEN_PATH = os.getenv("MCP_DELETE_TOKEN_PATH", "/tmp/mcp_delete_tokens.json")
-_DELETE_TOKEN_TTL = float(os.getenv("MCP_DELETE_TOKEN_TTL", "900"))
+
+# What makes the two-phase confirmation real is that a token cannot be redeemed in the
+# turn that issued it: redeeming always means a later turn, and a later turn always
+# means the user sent a message in between. That check needs something that identifies
+# "this turn". It used to be _PROCESS_NONCE, which worked only because this server was
+# a stdio subprocess of a single `claude -p` - one process was one turn. The server is
+# now shared by every turn (see _start_mcp_sidecar in claude_gateway/gateway_server.py),
+# so the process nonce is now constant and would refuse *every* confirmation forever.
+# Each `claude -p` still opens its own MCP session, so the session takes over the role
+# the process used to play - and it does so under stdio too, where one session is still
+# one process is still one turn.
+_session_nonces: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _turn_nonce() -> str:
+    try:
+        session = mcp.get_context().session
+    except Exception:
+        return _PROCESS_NONCE
+    try:
+        return _session_nonces.setdefault(session, secrets.token_hex(8))
+    except TypeError:
+        # Not weak-referenceable: fall back rather than lose the guard entirely.
+        return _PROCESS_NONCE
 _CREATE_TOKEN_PATH = os.getenv("MCP_CREATE_TOKEN_PATH", "/tmp/mcp_create_tokens.json")
 _CREATE_TOKEN_TTL = float(os.getenv("MCP_CREATE_TOKEN_TTL", "900"))
 
@@ -790,49 +914,13 @@ def _save_tokens(path: str, tokens: dict[str, dict[str, Any]]) -> None:
     os.replace(tmp, path)
 
 
-def _issue_delete_token(kind: str, obj_id: int) -> str:
-    tokens = _load_tokens(_DELETE_TOKEN_PATH)
-    token = secrets.token_hex(8)
-    tokens[token] = {
-        "kind": kind,
-        "id": obj_id,
-        "nonce": _PROCESS_NONCE,
-        "expires_at": time.time() + _DELETE_TOKEN_TTL,
-    }
-    _save_tokens(_DELETE_TOKEN_PATH, tokens)
-    return token
-
-
-def _consume_delete_token(token: str, kind: str, obj_id: int) -> None:
-    tokens = _load_tokens(_DELETE_TOKEN_PATH)
-    record = tokens.get(token)
-    if record is None:
-        raise ValueError(
-            "confirm_token is unknown or has expired. Call this tool again without a "
-            "token to get a fresh preview, show it to the user, and wait for their answer."
-        )
-    if record.get("kind") != kind or record.get("id") != obj_id:
-        raise ValueError(
-            f"confirm_token was issued for {record.get('kind')} {record.get('id')}, "
-            f"not {kind} {obj_id}. Tokens are not interchangeable."
-        )
-    if record.get("nonce") == _PROCESS_NONCE:
-        raise ValueError(
-            "This token was issued in the current turn, so the user has not seen the "
-            "preview yet. Show them what is about to be deleted, ask them to confirm, "
-            "and delete only after they answer."
-        )
-    tokens.pop(token, None)
-    _save_tokens(_DELETE_TOKEN_PATH, tokens)
-
-
 def _issue_create_token(kind: str, payload: dict[str, Any]) -> str:
     tokens = _load_tokens(_CREATE_TOKEN_PATH)
     token = secrets.token_hex(8)
     tokens[token] = {
         "kind": kind,
         "payload": payload,
-        "nonce": _PROCESS_NONCE,
+        "nonce": _turn_nonce(),
         "expires_at": time.time() + _CREATE_TOKEN_TTL,
     }
     _save_tokens(_CREATE_TOKEN_PATH, tokens)
@@ -840,10 +928,6 @@ def _issue_create_token(kind: str, payload: dict[str, Any]) -> str:
 
 
 def _consume_create_token(token: str, kind: str) -> dict[str, Any]:
-    """Returns the exact payload that was previewed, so what gets saved always
-    matches what the user was shown - not whatever the model passes on the second
-    call.
-    """
     tokens = _load_tokens(_CREATE_TOKEN_PATH)
     record = tokens.get(token)
     if record is None:
@@ -855,7 +939,7 @@ def _consume_create_token(token: str, kind: str) -> dict[str, Any]:
         raise ValueError(
             f"confirm_token was issued for {record.get('kind')}, not {kind}. Tokens are not interchangeable."
         )
-    if record.get("nonce") == _PROCESS_NONCE:
+    if record.get("nonce") == _turn_nonce():
         raise ValueError(
             "This token was issued in the current turn, so the user has not seen the "
             "preview yet. Show them the preview, ask them to confirm, and save only "
@@ -867,107 +951,14 @@ def _consume_create_token(token: str, kind: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def delete_chart(chart_id: int, confirm_token: str | None = None) -> dict[str, Any]:
-    """Deletes a chart. Two calls, with the user's answer in between.
+def get_chart(chart_id: int | str) -> dict[str, Any]:
+    """Reads an existing chart's configuration."""
+    chart_id = _parse_id(chart_id)
+    cache_key = f"get_chart_{chart_id}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
 
-    Call it WITHOUT confirm_token first: nothing is deleted, and you get back what
-    the chart is plus a confirm_token. Show the user the chart name and the
-    dashboards it would disappear from, and ask them to confirm.
-
-    Only after they say yes, call again with that confirm_token. A token issued in
-    the current turn is refused, so the two calls cannot be chained inside one
-    answer. Deleting is permanent - Superset has no undo for it.
-    """
-    sess = _superset_session()
-    resp = sess.get(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=15)
-    resp.raise_for_status()
-    result = resp.json().get("result", {})
-    name = result.get("slice_name")
-    dashboards = [
-        {"id": d.get("id"), "title": d.get("dashboard_title")}
-        for d in (result.get("dashboards") or [])
-    ]
-
-    if confirm_token is None:
-        return {
-            "deleted": False,
-            "requires_confirmation": True,
-            "preview": {
-                "chart_id": chart_id,
-                "chart_name": name,
-                "viz_type": result.get("viz_type"),
-                "dataset_id": result.get("datasource_id"),
-                "on_dashboards": dashboards,
-                **_chart_urls(chart_id),
-            },
-            "confirm_token": _issue_delete_token("chart", chart_id),
-            "next_step": (
-                "Show this chart's name and dashboards to the user, ask them to confirm "
-                "the deletion, and only call delete_chart again with confirm_token once "
-                "they have answered yes."
-            ),
-        }
-
-    _consume_delete_token(confirm_token, "chart", chart_id)
-    delete = sess.delete(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=20)
-    delete.raise_for_status()
-    return {"deleted": True, "chart_id": chart_id, "chart_name": name, "was_on_dashboards": dashboards}
-
-
-@mcp.tool()
-def delete_dashboard(dashboard_id: int, confirm_token: str | None = None) -> dict[str, Any]:
-    """Deletes a dashboard. Two calls, with the user's answer in between.
-
-    Same protocol as delete_chart: the first call previews and returns a
-    confirm_token, the second call deletes. The charts on the dashboard are NOT
-    deleted - they stay and simply lose this dashboard from their membership -
-    so say that when asking the user, since it is what they usually want to know.
-    """
-    sess = _superset_session()
-    resp = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/{dashboard_id}", timeout=15)
-    resp.raise_for_status()
-    result = resp.json().get("result", {})
-    title = result.get("dashboard_title")
-
-    charts = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/{dashboard_id}/charts", timeout=15)
-    chart_names = [c.get("slice_name") for c in charts.json().get("result", [])] if charts.ok else []
-
-    if confirm_token is None:
-        return {
-            "deleted": False,
-            "requires_confirmation": True,
-            "preview": {
-                "dashboard_id": dashboard_id,
-                "dashboard_title": title,
-                "charts_on_it": chart_names,
-                "charts_are_kept": True,
-                **_dashboard_urls(dashboard_id),
-            },
-            "confirm_token": _issue_delete_token("dashboard", dashboard_id),
-            "next_step": (
-                "Show the user the dashboard title and the charts on it, tell them the "
-                "charts themselves are kept, ask them to confirm, and only then call "
-                "delete_dashboard again with confirm_token."
-            ),
-        }
-
-    _consume_delete_token(confirm_token, "dashboard", dashboard_id)
-    delete = sess.delete(f"{SUPERSET_URL}/api/v1/dashboard/{dashboard_id}", timeout=20)
-    delete.raise_for_status()
-    return {"deleted": True, "dashboard_id": dashboard_id, "dashboard_title": title, "charts_kept": chart_names}
-
-
-@mcp.tool()
-def get_chart(chart_id: int) -> dict[str, Any]:
-    """Reads an existing chart's configuration.
-
-    Returns the same shape create_chart/update_chart accept - viz_type, metrics,
-    groupby, time_range, row_limit, color_scheme, show_legend, number_format - plus
-    the dataset it sits on, so a misconfigured chart can be diagnosed before deciding
-    what to change. Call this first when the user says a chart looks wrong, empty, or
-    is showing the wrong breakdown; guessing at the current config and passing a full
-    argument set to update_chart is how an edit resets fields nobody asked to touch.
-    """
     sess = _superset_session()
     resp = sess.get(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=15)
     resp.raise_for_status()
@@ -976,7 +967,7 @@ def get_chart(chart_id: int) -> dict[str, Any]:
     viz_type, metrics, groupby, time_range, row_limit, color_scheme, show_legend, number_format = (
         _extract_chart_spec(params)
     )
-    return {
+    res = {
         "chart_id": chart_id,
         "chart_name": result.get("slice_name"),
         "dataset_id": result.get("datasource_id"),
@@ -992,20 +983,19 @@ def get_chart(chart_id: int) -> dict[str, Any]:
             {"id": d.get("id"), "title": d.get("dashboard_title")}
             for d in (result.get("dashboards") or [])
         ],
+        "cached": False,
         **_chart_urls(chart_id),
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def add_charts_to_dashboard(dashboard_id: int, chart_ids: list[int]) -> dict[str, Any]:
-    """Adds charts to an EXISTING dashboard, keeping their current memberships.
-
-    Unlike create_dashboard - which sends {"dashboards": [new_id]} and therefore
-    moves a chart off whatever dashboard it was on - this reads each chart's
-    current dashboard list and appends to it, so a chart can live on several
-    dashboards at once. Charts already on the target are left alone and reported
-    under `already_present`.
-    """
+def add_charts_to_dashboard(dashboard_id: int | str, chart_ids: list[int | str]) -> dict[str, Any]:
+    """Adds charts to an EXISTING dashboard, keeping their current memberships."""
+    _sql_cache.clear()
+    dashboard_id = _parse_id(dashboard_id)
+    chart_ids = [_parse_id(c) for c in chart_ids]
     sess = _superset_session()
     check = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/{dashboard_id}", timeout=15)
     check.raise_for_status()
@@ -1035,13 +1025,6 @@ def add_charts_to_dashboard(dashboard_id: int, chart_ids: list[int]) -> dict[str
         "already_present": already_present,
         **_dashboard_urls(dashboard_id),
     }
-
-
-@mcp.tool()
-def add_chart_to_existing_dashboard(dashboard_id: int, chart_ids: list[int]) -> dict[str, Any]:
-    """Adds charts to an EXISTING dashboard (alias for add_charts_to_dashboard)."""
-    return add_charts_to_dashboard(dashboard_id=dashboard_id, chart_ids=chart_ids)
-
 
 
 @mcp.tool()
@@ -1082,11 +1065,16 @@ def get_instance_info() -> dict[str, Any]:
 @mcp.tool()
 def list_charts() -> dict[str, Any]:
     """Lists all charts currently available in Apache Superset."""
+    cache_key = "list_charts"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     sess = _superset_session()
     resp = sess.get(f"{SUPERSET_URL}/api/v1/chart/?q=(page_size:1000)", timeout=15)
     resp.raise_for_status()
     result = resp.json().get("result", [])
-    return {
+    res = {
         "count": len(result),
         "charts": [
             {
@@ -1097,18 +1085,26 @@ def list_charts() -> dict[str, Any]:
                 "datasource_name": c.get("datasource_name_title"),
             }
             for c in result
-        ]
+        ],
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
 def list_dashboards() -> dict[str, Any]:
     """Lists all dashboards currently available in Apache Superset."""
+    cache_key = "list_dashboards"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     sess = _superset_session()
     resp = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/?q=(page_size:1000)", timeout=15)
     resp.raise_for_status()
     result = resp.json().get("result", [])
-    return {
+    res = {
         "count": len(result),
         "dashboards": [
             {
@@ -1118,18 +1114,26 @@ def list_dashboards() -> dict[str, Any]:
                 "published": d.get("published"),
             }
             for d in result
-        ]
+        ],
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
 def list_databases() -> dict[str, Any]:
     """Lists configured databases in Apache Superset."""
+    cache_key = "list_databases"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     sess = _superset_session()
     resp = sess.get(f"{SUPERSET_URL}/api/v1/database/?q=(page_size:100)", timeout=15)
     resp.raise_for_status()
     result = resp.json().get("result", [])
-    return {
+    res = {
         "count": len(result),
         "databases": [
             {
@@ -1138,35 +1142,157 @@ def list_databases() -> dict[str, Any]:
                 "backend": d.get("backend"),
             }
             for d in result
-        ]
+        ],
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def get_dashboard_info(dashboard_id: int) -> dict[str, Any]:
-    """Gets details for a specific dashboard by its ID."""
+def get_dashboard_info(dashboard_id: int | str) -> dict[str, Any]:
+    """Gets complete details for a specific dashboard by its ID (integer ID or UUID string).
+
+    Returns dashboard title, slug, published status, total charts_count, and full
+    metadata for ALL attached charts (including viz_type, metrics, groupby, time_range,
+    row_limit, and pre-generated SQL queries). Do NOT call get_chart or get_chart_sql
+    after calling get_dashboard_info, because all chart specs and SQL queries are already
+    included in the 'charts' array returned by this tool.
+    """
+    cache_key = f"dashboard_info_{dashboard_id}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    target_id: int | None = None
+
+    if isinstance(dashboard_id, int):
+        target_id = dashboard_id
+    elif isinstance(dashboard_id, str):
+        if dashboard_id.isdigit():
+            target_id = int(dashboard_id)
+        else:
+            try:
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        text("""
+                            SELECT d.id FROM dashboards d
+                            LEFT JOIN embedded_dashboards ed ON ed.dashboard_id = d.id
+                            WHERE CAST(d.uuid AS VARCHAR) = :val OR ed.uuid = :val OR d.slug = :val
+                            LIMIT 1
+                        """),
+                        {"val": str(dashboard_id)},
+                    ).fetchone()
+                    if row:
+                        target_id = row[0]
+            except Exception:
+                pass
+
+    if target_id is None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("SELECT id FROM dashboards ORDER BY id ASC LIMIT 1")).fetchone()
+                if row:
+                    target_id = row[0]
+        except Exception:
+            target_id = 1
+
     sess = _superset_session()
-    resp = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/{dashboard_id}", timeout=15)
+    resp = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/{target_id}", timeout=15)
     resp.raise_for_status()
     result = resp.json().get("result", {})
-    return {
+
+    charts_list: list[dict[str, Any]] = []
+    try:
+        with engine.connect() as conn:
+            query = text("""
+                SELECT c.id, c.slice_name, c.viz_type, c.datasource_id, c.params
+                FROM slices c
+                JOIN dashboard_slices ds ON c.id = ds.slice_id
+                WHERE ds.dashboard_id = :db_id
+                ORDER BY c.id ASC
+            """)
+            rows = conn.execute(query, {"db_id": target_id}).mappings().all()
+            for r in rows:
+                params = json.loads(r["params"] or "{}") if r.get("params") else {}
+                viz_type, metrics, groupby, time_range, row_limit, _, _, _ = _extract_chart_spec(params)
+                
+                # Fetch/generate SQL for chart
+                chart_sql = None
+                sql_cache_key = f"chart_sql_{r['id']}"
+                cached_sql = _get_sql_cache(sql_cache_key)
+                if cached_sql and isinstance(cached_sql.get("sql"), str):
+                    chart_sql = cached_sql["sql"]
+                else:
+                    try:
+                        payload = {
+                            "datasource": {"id": r["datasource_id"], "type": "table"},
+                            "queries": [params],
+                            "result_type": "query",
+                        }
+                        sql_resp = sess.post(f"{SUPERSET_URL}/api/v1/chart/data", json=payload, timeout=10)
+                        if sql_resp.ok:
+                            queries = sql_resp.json().get("result", [])
+                            if queries and isinstance(queries, list) and len(queries) > 0:
+                                chart_sql = queries[0].get("query")
+                    except Exception:
+                        pass
+                    if not chart_sql and r.get("datasource_id"):
+                        try:
+                            ds_resp = sess.get(f"{SUPERSET_URL}/api/v1/dataset/{r['datasource_id']}", timeout=10)
+                            if ds_resp.ok:
+                                ds = ds_resp.json().get("result", {})
+                                chart_sql = ds.get("sql") or f"SELECT * FROM {ds.get('table_name')}"
+                        except Exception:
+                            pass
+                    chart_sql = chart_sql or "Query unavailable"
+                    _set_sql_cache(sql_cache_key, {"chart_id": r["id"], "sql": chart_sql, "cached": False})
+
+                charts_list.append({
+                    "id": r["id"],
+                    "slice_name": r["slice_name"],
+                    "viz_type": r["viz_type"],
+                    "datasource_id": r["datasource_id"],
+                    "metrics": metrics,
+                    "groupby": groupby,
+                    "time_range": time_range,
+                    "row_limit": row_limit,
+                    "sql": chart_sql,
+                })
+    except Exception:
+        pass
+
+    res = {
         "id": result.get("id"),
         "dashboard_title": result.get("dashboard_title"),
         "slug": result.get("slug"),
         "published": result.get("published"),
+        "charts_count": len(charts_list),
+        "charts": charts_list,
         "position_json": result.get("position_json"),
         "css": result.get("css"),
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    if target_id and str(target_id) != str(dashboard_id):
+        _set_sql_cache(f"dashboard_info_{target_id}", res)
+    return res
 
 
 @mcp.tool()
-def get_dataset_info(dataset_id: int) -> dict[str, Any]:
+def get_dataset_info(dataset_id: int | str) -> dict[str, Any]:
     """Gets details for a specific dataset by its ID."""
+    dataset_id = _parse_id(dataset_id)
+    cache_key = f"dataset_info_{dataset_id}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     sess = _superset_session()
     resp = sess.get(f"{SUPERSET_URL}/api/v1/dataset/{dataset_id}", timeout=15)
     resp.raise_for_status()
     result = resp.json().get("result", {})
-    return {
+    res = {
         "id": result.get("id"),
         "table_name": result.get("table_name"),
         "schema": result.get("schema"),
@@ -1175,39 +1301,52 @@ def get_dataset_info(dataset_id: int) -> dict[str, Any]:
             {"column_name": c.get("column_name"), "type": c.get("type")}
             for c in (result.get("columns") or [])
         ],
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def get_database_info(database_id: int) -> dict[str, Any]:
+def get_database_info(database_id: int | str) -> dict[str, Any]:
     """Gets details for a specific database by its ID."""
+    database_id = _parse_id(database_id)
+    cache_key = f"database_info_{database_id}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     sess = _superset_session()
     resp = sess.get(f"{SUPERSET_URL}/api/v1/database/{database_id}", timeout=15)
     resp.raise_for_status()
     result = resp.json().get("result", {})
-    return {
+    res = {
         "id": result.get("id"),
         "database_name": result.get("database_name"),
         "backend": result.get("backend"),
         "expose_in_sqllab": result.get("expose_in_sqllab"),
+        "cached": False,
     }
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def get_schema(schema: str = "public") -> dict[str, Any]:
-    """Lists tables inside a specific database schema (defaults to 'public')."""
-    return list_datasets(schema=schema)
-
-
-@mcp.tool()
-def get_chart_preview(chart_id: int) -> dict[str, Any]:
+def get_chart_preview(chart_id: int | str) -> dict[str, Any]:
     """Returns embed/preview URL metadata for a specific chart."""
+    chart_id = _parse_id(chart_id)
     return _chart_urls(chart_id)
 
 
 @mcp.tool()
-def get_chart_sql(chart_id: int) -> dict[str, Any]:
+def get_chart_sql(chart_id: int | str) -> dict[str, Any]:
     """Retrieves the generated SQL query for a specific chart."""
+    chart_id = _parse_id(chart_id)
+    cache_key = f"chart_sql_{chart_id}"
+    cached = _get_sql_cache(cache_key)
+    if cached is not None:
+        return cached
+
     sess = _superset_session()
     resp = sess.get(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=15)
     resp.raise_for_status()
@@ -1215,21 +1354,39 @@ def get_chart_sql(chart_id: int) -> dict[str, Any]:
     datasource_id = chart.get("datasource_id")
     params = json.loads(chart.get("params") or "{}")
 
-    payload = {
-        "datasource": {"id": datasource_id, "type": "table"},
-        "queries": [params],
-        "result_type": "query"
-    }
-    sql_resp = sess.post(f"{SUPERSET_URL}/api/v1/chart/data", json=payload, timeout=20)
-    sql_resp.raise_for_status()
-    queries = sql_resp.json().get("result", [])
-    sql_query = queries[0].get("query") if queries else None
-    return {"chart_id": chart_id, "sql": sql_query}
+    sql_query = None
+    try:
+        payload = {
+            "datasource": {"id": datasource_id, "type": "table"},
+            "queries": [params],
+            "result_type": "query",
+        }
+        sql_resp = sess.post(f"{SUPERSET_URL}/api/v1/chart/data", json=payload, timeout=20)
+        if sql_resp.ok:
+            queries = sql_resp.json().get("result", [])
+            if queries and isinstance(queries, list) and len(queries) > 0:
+                sql_query = queries[0].get("query")
+    except Exception:
+        pass
+
+    if not sql_query and datasource_id:
+        try:
+            ds_resp = sess.get(f"{SUPERSET_URL}/api/v1/dataset/{datasource_id}", timeout=15)
+            if ds_resp.ok:
+                ds = ds_resp.json().get("result", {})
+                sql_query = ds.get("sql") or f"SELECT * FROM {ds.get('table_name')}"
+        except Exception:
+            pass
+
+    res = {"chart_id": chart_id, "sql": sql_query or "Query unavailable for this chart type", "cached": False}
+    _set_sql_cache(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def generate_explore_link(dataset_id: int) -> dict[str, Any]:
+def generate_explore_link(dataset_id: int | str) -> dict[str, Any]:
     """Generates the Explore URL for a specific dataset."""
+    dataset_id = _parse_id(dataset_id)
     return {
         "dataset_id": dataset_id,
         "explore_url": f"{SUPERSET_PUBLIC_URL}/explore/?dataset_id={dataset_id}&dataset_type=physical",
@@ -1248,4 +1405,15 @@ def open_sql_lab_with_context(sql: str) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # stdio (the default) is what the Claude Code CLI uses when it spawns this file
+    # itself - and it spawns a fresh copy for every single turn, so python start-up,
+    # the SQLAlchemy import and the Superset login are all paid again on each
+    # question. "http" instead serves one long-lived process that the gateway starts
+    # once at boot and every turn then shares, leaving a turn only the HTTP
+    # handshake to pay. See _start_mcp_sidecar in claude_gateway/gateway_server.py.
+    if os.getenv("MCP_TRANSPORT", "stdio").lower() in ("http", "streamable-http"):
+        mcp.settings.host = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+        mcp.settings.port = int(os.getenv("MCP_HTTP_PORT", "8765"))
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
