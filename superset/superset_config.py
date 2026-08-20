@@ -39,7 +39,41 @@ CORS_OPTIONS = {
 FEATURE_FLAGS = {
     "EMBEDDED_SUPERSET": True,
     "ENABLE_TEMPLATE_PROCESSING": True,
+    "EXTRA_CATEGORICAL_COLOR_SCHEMES": True,
 }
+
+EXTRA_CATEGORICAL_COLOR_SCHEMES = [
+    {
+        "id": "redScheme",
+        "label": "Red Scheme",
+        "colors": ["#E74C3C", "#C0392B", "#FF4D4F", "#D9534F", "#CF1322", "#A8071A", "#820014", "#FF7875"],
+    },
+    {
+        "id": "blueScheme",
+        "label": "Blue Scheme",
+        "colors": ["#1890FF", "#096DD9", "#0050B3", "#003A8C", "#002766", "#40A9FF", "#69C0FF", "#91D5FF"],
+    },
+    {
+        "id": "greenScheme",
+        "label": "Green Scheme",
+        "colors": ["#52C41A", "#389E0D", "#237804", "#135200", "#73D13D", "#95DE64", "#B7EB8F", "#D9F7BE"],
+    },
+    {
+        "id": "orangeScheme",
+        "label": "Orange Scheme",
+        "colors": ["#FA8C16", "#D46B08", "#AD4E00", "#873800", "#FFA940", "#FFC069", "#FFD591", "#FFE7BA"],
+    },
+    {
+        "id": "purpleScheme",
+        "label": "Purple Scheme",
+        "colors": ["#722ED1", "#531DAB", "#391085", "#22075E", "#9254DE", "#B37FEB", "#D3ADF7", "#EFDBFF"],
+    },
+    {
+        "id": "yellowScheme",
+        "label": "Yellow Scheme",
+        "colors": ["#FADB14", "#D4B106", "#AD8B00", "#876800", "#FFEC3D", "#FFF566", "#FFFF80", "#FFFBE6"],
+    },
+]
 
 TALISMAN_ENABLED = False
 TALISMAN_CONFIG = {

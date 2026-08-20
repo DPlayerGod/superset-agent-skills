@@ -429,6 +429,100 @@ def _adhoc_metric(expression: str) -> dict[str, Any]:
 # aggregate, so update_chart can still edit charts built in the Superset UI.
 _SAVED_METRICS = {"count"}
 
+_COLOR_MAP = {
+    "do": "#E74C3C",
+    "đỏ": "#E74C3C",
+    "red": "#E74C3C",
+    "xanh": "#1890FF",
+    "xanh duong": "#1890FF",
+    "xanh dương": "#1890FF",
+    "xanh bien": "#1890FF",
+    "xanh biển": "#1890FF",
+    "blue": "#1890FF",
+    "xanh la": "#52C41A",
+    "xanh lá": "#52C41A",
+    "xanh luc": "#52C41A",
+    "xanh lục": "#52C41A",
+    "green": "#52C41A",
+    "cam": "#FA8C16",
+    "orange": "#FA8C16",
+    "tim": "#722ED1",
+    "tím": "#722ED1",
+    "purple": "#722ED1",
+    "vang": "#FADB14",
+    "vàng": "#FADB14",
+    "yellow": "#FADB14",
+    "hong": "#EB2F96",
+    "hồng": "#EB2F96",
+    "pink": "#EB2F96",
+    "xam": "#8C8C8C",
+    "xám": "#8C8C8C",
+    "gray": "#8C8C8C",
+    "grey": "#8C8C8C",
+    "den": "#262626",
+    "đen": "#262626",
+    "black": "#262626",
+    "trang": "#FFFFFF",
+    "trắng": "#FFFFFF",
+    "white": "#FFFFFF",
+    "teal": "#13C2C2",
+    "cyan": "#13C2C2",
+}
+
+
+_COLOR_SCHEME_MAP = {
+    "do": "redScheme",
+    "đỏ": "redScheme",
+    "red": "redScheme",
+    "xanh": "blueScheme",
+    "xanh duong": "blueScheme",
+    "xanh dương": "blueScheme",
+    "xanh bien": "blueScheme",
+    "xanh biển": "blueScheme",
+    "blue": "blueScheme",
+    "xanh la": "greenScheme",
+    "xanh lá": "greenScheme",
+    "xanh luc": "greenScheme",
+    "xanh lục": "greenScheme",
+    "green": "greenScheme",
+    "cam": "orangeScheme",
+    "orange": "orangeScheme",
+    "tim": "purpleScheme",
+    "tím": "purpleScheme",
+    "purple": "purpleScheme",
+    "vang": "yellowScheme",
+    "vàng": "yellowScheme",
+    "yellow": "yellowScheme",
+}
+
+
+def _resolve_color_scheme(color_name: str | None) -> str | None:
+    if not color_name:
+        return None
+    raw = color_name.strip().lower()
+    return _COLOR_SCHEME_MAP.get(raw)
+
+
+def _hex_to_rgba(hex_color: str, alpha: float = 1.0) -> dict[str, Any]:
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) == 3:
+        hex_color = "".join(c * 2 for c in hex_color)
+    if len(hex_color) == 6:
+        r, g, b = tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+        return {"r": r, "g": g, "b": b, "a": alpha}
+    return {"r": 24, "g": 144, "b": 255, "a": alpha}
+
+
+def _resolve_color(color_name_or_hex: str | None) -> str | None:
+    if not color_name_or_hex:
+        return None
+    raw = color_name_or_hex.strip().lower()
+    if raw in _COLOR_MAP:
+        return _COLOR_MAP[raw]
+    if re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", raw):
+        return raw.upper()
+    return None
+
 
 def _metric_param(expression: str) -> dict[str, Any] | str:
     if expression.strip().lower() in _SAVED_METRICS:
@@ -445,6 +539,12 @@ def _build_chart_params(
     color_scheme: str | None = None,
     show_legend: bool | None = None,
     number_format: str | None = None,
+    x_axis_sort: str | None = None,
+    x_axis_sort_asc: bool | None = None,
+    order_desc: bool | None = None,
+    orientation: str | None = None,
+    color: str | None = None,
+    description: str | None = None,
 ) -> dict[str, Any]:
     adhoc_metrics = [_metric_param(metric) for metric in metrics]
     params: dict[str, Any] = {
@@ -455,9 +555,42 @@ def _build_chart_params(
         "row_limit": row_limit,
         "time_range": time_range,
     }
+    if description is not None:
+        params["description"] = description
+
+    effective_scheme = color_scheme or _resolve_color_scheme(color)
+    if effective_scheme:
+        params["color_scheme"] = effective_scheme
+
+    resolved_color = _resolve_color(color)
+    if resolved_color:
+        params["color_picker"] = _hex_to_rgba(resolved_color)
+        label_colors: dict[str, str] = {}
+        for m in adhoc_metrics:
+            if isinstance(m, dict) and "label" in m:
+                label_colors[m["label"]] = resolved_color
+            elif isinstance(m, str):
+                label_colors[m] = resolved_color
+        for raw_m in metrics:
+            label_colors[raw_m] = resolved_color
+        if label_colors:
+            params["label_colors"] = label_colors
+
     if viz_type in ("echarts_timeseries_line", "echarts_timeseries_bar"):
         params["x_axis"] = groupby[0] if groupby else None
         params["groupby"] = list(groupby[1:])
+        if orientation is not None:
+            params["orientation"] = orientation
+        if order_desc is not None:
+            params["order_desc"] = order_desc
+        if x_axis_sort is not None:
+            params["x_axis_sort"] = x_axis_sort
+        if x_axis_sort_asc is not None:
+            params["x_axis_sort_asc"] = x_axis_sort_asc
+            if order_desc is None:
+                params["order_desc"] = not x_axis_sort_asc
+        elif order_desc is not None:
+            params["x_axis_sort_asc"] = not order_desc
     elif viz_type == "pie":
         # Pie's control panel is [["groupby"], ["metric"]] - it reads a single
         # `metric` and ignores `metrics` entirely, so a plural list renders blank.
@@ -580,6 +713,12 @@ def create_chart(
     color_scheme: str | None = None,
     show_legend: bool | None = None,
     number_format: str | None = None,
+    x_axis_sort: str | None = None,
+    x_axis_sort_asc: bool | None = None,
+    order_desc: bool | None = None,
+    orientation: str | None = None,
+    color: str | None = None,
+    description: str | None = None,
     confirm_token: str | None = None,
 ) -> dict[str, Any]:
     """Creates a Superset chart on an existing dataset. Two calls, with the user's
@@ -613,6 +752,16 @@ def create_chart(
     ["working_month_year", "project_name"]. Reversing it plots projects on the
     x-axis and silently drops the monthly breakdown the question asked for.
 
+    Sorting & orientation (for echarts_timeseries_bar):
+    x_axis_sort: metric or column to sort x-axis categories by (e.g. "SUM(project_allocated_hc)").
+    x_axis_sort_asc: True for ascending sort, False for descending.
+    order_desc: True for descending sort, False for ascending.
+    orientation: "vertical" (default column chart) or "horizontal" (horizontal bar chart).
+
+    Colors & Subtitle:
+    color: Natural color name ("đỏ", "xanh dương", "xanh lá", "cam", "tím", "vàng", "hồng", "red", "blue", "green") or hex "#E74C3C".
+    description: Subtitle / description / explanation markdown for the chart.
+
     Style controls - all optional, ignored (left at Superset's default) for viz_types
     that do not support them:
     color_scheme: a Superset palette id (e.g. "supersetColors", "d3Category10",
@@ -628,7 +777,20 @@ def create_chart(
     """
     dataset_id = _parse_id(dataset_id)
     params = _build_chart_params(
-        viz_type, metrics, groupby or [], time_range, row_limit, color_scheme, show_legend, number_format
+        viz_type,
+        metrics,
+        groupby or [],
+        time_range,
+        row_limit,
+        color_scheme,
+        show_legend,
+        number_format,
+        x_axis_sort,
+        x_axis_sort_asc,
+        order_desc,
+        orientation,
+        color,
+        description,
     )
     sess = _superset_session()
 
@@ -653,6 +815,12 @@ def create_chart(
                     "color_scheme": color_scheme,
                     "show_legend": show_legend,
                     "number_format": number_format,
+                    "x_axis_sort": x_axis_sort,
+                    "x_axis_sort_asc": x_axis_sort_asc,
+                    "order_desc": order_desc,
+                    "orientation": orientation,
+                    "color": color,
+                    "description": description,
                 },
             ),
             "next_step": (
@@ -673,16 +841,26 @@ def create_chart(
         payload.get("color_scheme"),
         payload.get("show_legend"),
         payload.get("number_format"),
+        payload.get("x_axis_sort"),
+        payload.get("x_axis_sort_asc"),
+        payload.get("order_desc"),
+        payload.get("orientation"),
+        payload.get("color"),
+        payload.get("description"),
     )
+    chart_payload: dict[str, Any] = {
+        "slice_name": payload["chart_name"],
+        "viz_type": payload["viz_type"],
+        "datasource_id": payload["dataset_id"],
+        "datasource_type": "table",
+        "params": json.dumps(saved_params),
+    }
+    if payload.get("description"):
+        chart_payload["description"] = payload["description"]
+
     resp = sess.post(
         f"{SUPERSET_URL}/api/v1/chart/",
-        json={
-            "slice_name": payload["chart_name"],
-            "viz_type": payload["viz_type"],
-            "datasource_id": payload["dataset_id"],
-            "datasource_type": "table",
-            "params": json.dumps(saved_params),
-        },
+        json=chart_payload,
         timeout=20,
     )
     resp.raise_for_status()
@@ -693,7 +871,22 @@ def create_chart(
 
 def _extract_chart_spec(
     params: dict[str, Any],
-) -> tuple[str, list[str], list[str], str, int, str | None, bool | None, str | None]:
+) -> tuple[
+    str,
+    list[str],
+    list[str],
+    str,
+    int,
+    str | None,
+    bool | None,
+    str | None,
+    str | None,
+    bool | None,
+    bool | None,
+    str | None,
+    str | None,
+    str | None,
+]:
     """Reverses _build_chart_params so update_chart can inherit fields the caller omits."""
     viz_type = params.get("viz_type", "table")
     time_range = params.get("time_range", "No filter")
@@ -705,6 +898,16 @@ def _extract_chart_spec(
         if viz_type in ("echarts_timeseries_line", "echarts_timeseries_bar")
         else params.get("number_format")
     )
+    x_axis_sort = params.get("x_axis_sort")
+    x_axis_sort_asc = params.get("x_axis_sort_asc")
+    order_desc = params.get("order_desc")
+    orientation = params.get("orientation")
+    description = params.get("description")
+    
+    # Try extracting color from color_picker or label_colors
+    color = None
+    if isinstance(params.get("label_colors"), dict) and params["label_colors"]:
+        color = next(iter(params["label_colors"].values()), None)
 
     def expr(metric: Any) -> str:
         return metric.get("sqlExpression", "") if isinstance(metric, dict) else str(metric)
@@ -727,7 +930,22 @@ def _extract_chart_spec(
     else:
         metrics = [expr(m) for m in params.get("metrics", [])]
         groupby = list(params.get("groupby", []))
-    return viz_type, metrics, groupby, time_range, row_limit, color_scheme, show_legend, number_format
+    return (
+        viz_type,
+        metrics,
+        groupby,
+        time_range,
+        row_limit,
+        color_scheme,
+        show_legend,
+        number_format,
+        x_axis_sort,
+        x_axis_sort_asc,
+        order_desc,
+        orientation,
+        color,
+        description,
+    )
 
 
 @mcp.tool()
@@ -742,12 +960,19 @@ def update_chart(
     color_scheme: str | None = None,
     show_legend: bool | None = None,
     number_format: str | None = None,
+    x_axis_sort: str | None = None,
+    x_axis_sort_asc: bool | None = None,
+    order_desc: bool | None = None,
+    orientation: str | None = None,
+    color: str | None = None,
+    description: str | None = None,
 ) -> dict[str, Any]:
     """Edits an existing Superset chart in place. Any argument left as None keeps
     its current value; pass only the fields you want to change.
 
-    Same viz_type/metrics semantics as create_chart, including the color_scheme/
-    show_legend/number_format style controls.
+    Same viz_type/metrics semantics as create_chart, including sorting (x_axis_sort,
+    x_axis_sort_asc, order_desc), orientation ("vertical"/"horizontal"), color ("đỏ", "xanh",
+    "cam", "tím", "vàng", "#HEX"), subtitle (description), and style controls.
     """
     chart_id = _parse_id(chart_id)
     sess = _superset_session()
@@ -764,18 +989,37 @@ def update_chart(
         cur_color_scheme,
         cur_show_legend,
         cur_number_format,
+        cur_x_axis_sort,
+        cur_x_axis_sort_asc,
+        cur_order_desc,
+        cur_orientation,
+        cur_color,
+        cur_description,
     ) = _extract_chart_spec(current_params)
 
     effective_viz_type = viz_type if viz_type is not None else cur_viz
+    target_color_scheme = color_scheme
+    if target_color_scheme is None:
+        if color is not None:
+            target_color_scheme = _resolve_color_scheme(color)
+        if target_color_scheme is None:
+            target_color_scheme = cur_color_scheme
+
     new_params = _build_chart_params(
         effective_viz_type,
         metrics if metrics is not None else cur_metrics,
         groupby if groupby is not None else cur_groupby,
         time_range if time_range is not None else cur_time_range,
         row_limit if row_limit is not None else cur_row_limit,
-        color_scheme if color_scheme is not None else cur_color_scheme,
+        target_color_scheme,
         show_legend if show_legend is not None else cur_show_legend,
         number_format if number_format is not None else cur_number_format,
+        x_axis_sort if x_axis_sort is not None else cur_x_axis_sort,
+        x_axis_sort_asc if x_axis_sort_asc is not None else cur_x_axis_sort_asc,
+        order_desc if order_desc is not None else cur_order_desc,
+        orientation if orientation is not None else cur_orientation,
+        color if color is not None else cur_color,
+        description if description is not None else cur_description,
     )
 
     payload: dict[str, Any] = {
@@ -784,9 +1028,41 @@ def update_chart(
     }
     if chart_name is not None:
         payload["slice_name"] = chart_name
+    if description is not None:
+        payload["description"] = description
 
     resp = sess.put(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", json=payload, timeout=20)
     resp.raise_for_status()
+
+    resolved_color = _resolve_color(color)
+    if resolved_color:
+        dashboards = current_result.get("dashboards") or []
+        for d in dashboards:
+            dash_id = d.get("id")
+            if not dash_id:
+                continue
+            try:
+                dash_resp = sess.get(f"{SUPERSET_URL}/api/v1/dashboard/{dash_id}", timeout=15)
+                if dash_resp.ok:
+                    dash_res = dash_resp.json().get("result", {})
+                    meta = json.loads(dash_res.get("json_metadata") or "{}")
+                    label_cols = meta.setdefault("label_colors", {})
+                    map_cols = meta.setdefault("map_label_colors", {})
+                    target_metrics = metrics if metrics is not None else cur_metrics
+                    for m in target_metrics:
+                        label_cols[m] = resolved_color
+                        map_cols[m] = resolved_color
+                    meta["label_colors"] = label_cols
+                    meta["map_label_colors"] = map_cols
+                    sess.put(
+                        f"{SUPERSET_URL}/api/v1/dashboard/{dash_id}",
+                        json={"json_metadata": json.dumps(meta)},
+                        timeout=20,
+                    )
+                    _invalidate_sql_cache(f"dashboard_info_{dash_id}")
+            except Exception as e:
+                logger.warning("Failed to sync dashboard label_colors: {}", e)
+
     _invalidate_sql_cache(f"get_chart_{chart_id}", f"chart_sql_{chart_id}", "list_charts")
     return {"chart_id": chart_id, **_chart_urls(chart_id)}
 
@@ -930,20 +1206,15 @@ def _issue_create_token(kind: str, payload: dict[str, Any]) -> str:
 def _consume_create_token(token: str, kind: str) -> dict[str, Any]:
     tokens = _load_tokens(_CREATE_TOKEN_PATH)
     record = tokens.get(token)
-    if record is None:
+    if not record:
+        raise ValueError("Invalid or expired confirm_token. Start over without a token.")
+    if record["kind"] != kind:
+        raise ValueError(f"Token is for {record['kind']}, not {kind}.")
+    if record["nonce"] == _turn_nonce():
         raise ValueError(
-            "confirm_token is unknown or has expired. Call this tool again without a "
-            "token to get a fresh preview, show it to the user, and wait for their answer."
-        )
-    if record.get("kind") != kind:
-        raise ValueError(
-            f"confirm_token was issued for {record.get('kind')}, not {kind}. Tokens are not interchangeable."
-        )
-    if record.get("nonce") == _turn_nonce():
-        raise ValueError(
-            "This token was issued in the current turn, so the user has not seen the "
-            "preview yet. Show them the preview, ask them to confirm, and save only "
-            "after they answer."
+            "confirm_token was issued in THIS turn. You must show the preview to the "
+            "user and ask them to confirm; only call again once they say yes in a "
+            "later turn."
         )
     tokens.pop(token, None)
     _save_tokens(_CREATE_TOKEN_PATH, tokens)
@@ -964,9 +1235,22 @@ def get_chart(chart_id: int | str) -> dict[str, Any]:
     resp.raise_for_status()
     result = resp.json().get("result", {})
     params = json.loads(result.get("params") or "{}")
-    viz_type, metrics, groupby, time_range, row_limit, color_scheme, show_legend, number_format = (
-        _extract_chart_spec(params)
-    )
+    (
+        viz_type,
+        metrics,
+        groupby,
+        time_range,
+        row_limit,
+        color_scheme,
+        show_legend,
+        number_format,
+        x_axis_sort,
+        x_axis_sort_asc,
+        order_desc,
+        orientation,
+        color,
+        description,
+    ) = _extract_chart_spec(params)
     res = {
         "chart_id": chart_id,
         "chart_name": result.get("slice_name"),
@@ -979,6 +1263,12 @@ def get_chart(chart_id: int | str) -> dict[str, Any]:
         "color_scheme": color_scheme,
         "show_legend": show_legend,
         "number_format": number_format,
+        "x_axis_sort": x_axis_sort,
+        "x_axis_sort_asc": x_axis_sort_asc,
+        "order_desc": order_desc,
+        "orientation": orientation,
+        "color": color,
+        "description": result.get("description") or description,
         "dashboards": [
             {"id": d.get("id"), "title": d.get("dashboard_title")}
             for d in (result.get("dashboards") or [])
@@ -1215,7 +1505,7 @@ def get_dashboard_info(dashboard_id: int | str) -> dict[str, Any]:
             rows = conn.execute(query, {"db_id": target_id}).mappings().all()
             for r in rows:
                 params = json.loads(r["params"] or "{}") if r.get("params") else {}
-                viz_type, metrics, groupby, time_range, row_limit, _, _, _ = _extract_chart_spec(params)
+                viz_type, metrics, groupby, time_range, row_limit, *style_and_sort = _extract_chart_spec(params)
                 
                 # Fetch/generate SQL for chart
                 chart_sql = None
