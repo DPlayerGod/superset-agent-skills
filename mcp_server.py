@@ -545,6 +545,10 @@ def _build_chart_params(
     orientation: str | None = None,
     color: str | None = None,
     description: str | None = None,
+    x_axis_title: str | None = None,
+    y_axis_title: str | None = None,
+    x_axis_label: str | None = None,
+    y_axis_label: str | None = None,
 ) -> dict[str, Any]:
     adhoc_metrics = [_metric_param(metric) for metric in metrics]
     params: dict[str, Any] = {
@@ -557,6 +561,8 @@ def _build_chart_params(
     }
     if description is not None:
         params["description"] = description
+        params["subheader"] = description
+        params["subtitle"] = description
 
     effective_scheme = color_scheme or _resolve_color_scheme(color)
     if effective_scheme:
@@ -576,6 +582,9 @@ def _build_chart_params(
         if label_colors:
             params["label_colors"] = label_colors
 
+    effective_x_title = x_axis_title or x_axis_label
+    effective_y_title = y_axis_title or y_axis_label
+
     if viz_type in ("echarts_timeseries_line", "echarts_timeseries_bar"):
         params["x_axis"] = groupby[0] if groupby else None
         params["groupby"] = list(groupby[1:])
@@ -591,6 +600,15 @@ def _build_chart_params(
                 params["order_desc"] = not x_axis_sort_asc
         elif order_desc is not None:
             params["x_axis_sort_asc"] = not order_desc
+        if effective_x_title is not None:
+            params["x_axis_title"] = effective_x_title
+            params["x_axis_label"] = effective_x_title
+            params["x_axis_title_margin"] = 30
+        if effective_y_title is not None:
+            params["y_axis_title"] = effective_y_title
+            params["y_axis_label"] = effective_y_title
+            params["y_axis_title_margin"] = 30
+            params["y_axis_title_position"] = "Left"
     elif viz_type == "pie":
         # Pie's control panel is [["groupby"], ["metric"]] - it reads a single
         # `metric` and ignores `metrics` entirely, so a plural list renders blank.
@@ -719,6 +737,10 @@ def create_chart(
     orientation: str | None = None,
     color: str | None = None,
     description: str | None = None,
+    x_axis_title: str | None = None,
+    y_axis_title: str | None = None,
+    x_axis_label: str | None = None,
+    y_axis_label: str | None = None,
     confirm_token: str | None = None,
 ) -> dict[str, Any]:
     """Creates a Superset chart on an existing dataset. Two calls, with the user's
@@ -758,9 +780,11 @@ def create_chart(
     order_desc: True for descending sort, False for ascending.
     orientation: "vertical" (default column chart) or "horizontal" (horizontal bar chart).
 
-    Colors & Subtitle:
+    Colors, Subtitle & Axis Titles:
     color: Natural color name ("đỏ", "xanh dương", "xanh lá", "cam", "tím", "vàng", "hồng", "red", "blue", "green") or hex "#E74C3C".
-    description: Subtitle / description / explanation markdown for the chart.
+    description: Subtitle / description / explanation markdown for the chart (shown under Big Number or as info icon on bar chart).
+    x_axis_title / x_axis_label: Title / label for X-axis (e.g. "Thời gian", "Tên dự án").
+    y_axis_title / y_axis_label: Title / label for Y-axis (e.g. "Doanh thu (triệu VNĐ)", "Tổng FTE").
 
     Style controls - all optional, ignored (left at Superset's default) for viz_types
     that do not support them:
@@ -776,6 +800,8 @@ def create_chart(
     formats per-column instead).
     """
     dataset_id = _parse_id(dataset_id)
+    target_x_title = x_axis_title or x_axis_label
+    target_y_title = y_axis_title or y_axis_label
     params = _build_chart_params(
         viz_type,
         metrics,
@@ -791,6 +817,8 @@ def create_chart(
         orientation,
         color,
         description,
+        target_x_title,
+        target_y_title,
     )
     sess = _superset_session()
 
@@ -821,6 +849,8 @@ def create_chart(
                     "orientation": orientation,
                     "color": color,
                     "description": description,
+                    "x_axis_title": target_x_title,
+                    "y_axis_title": target_y_title,
                 },
             ),
             "next_step": (
@@ -847,6 +877,8 @@ def create_chart(
         payload.get("orientation"),
         payload.get("color"),
         payload.get("description"),
+        payload.get("x_axis_title"),
+        payload.get("y_axis_title"),
     )
     chart_payload: dict[str, Any] = {
         "slice_name": payload["chart_name"],
@@ -886,6 +918,8 @@ def _extract_chart_spec(
     str | None,
     str | None,
     str | None,
+    str | None,
+    str | None,
 ]:
     """Reverses _build_chart_params so update_chart can inherit fields the caller omits."""
     viz_type = params.get("viz_type", "table")
@@ -902,7 +936,9 @@ def _extract_chart_spec(
     x_axis_sort_asc = params.get("x_axis_sort_asc")
     order_desc = params.get("order_desc")
     orientation = params.get("orientation")
-    description = params.get("description")
+    description = params.get("description") or params.get("subheader") or params.get("subtitle")
+    x_axis_title = params.get("x_axis_title") or params.get("x_axis_label")
+    y_axis_title = params.get("y_axis_title") or params.get("y_axis_label")
     
     # Try extracting color from color_picker or label_colors
     color = None
@@ -945,6 +981,8 @@ def _extract_chart_spec(
         orientation,
         color,
         description,
+        x_axis_title,
+        y_axis_title,
     )
 
 
@@ -966,19 +1004,32 @@ def update_chart(
     orientation: str | None = None,
     color: str | None = None,
     description: str | None = None,
+    x_axis_title: str | None = None,
+    y_axis_title: str | None = None,
+    x_axis_label: str | None = None,
+    y_axis_label: str | None = None,
+    confirm_token: str | None = None,
 ) -> dict[str, Any]:
-    """Edits an existing Superset chart in place. Any argument left as None keeps
-    its current value; pass only the fields you want to change.
+    """Edits an existing Superset chart in place. Two calls, with the user's
+    answer in between - nothing is saved to Superset until they confirm.
+
+    Call it WITHOUT confirm_token first: no chart is modified, and you get back a
+    live preview (rendered from unsaved form_data) plus a confirm_token. Show the
+    user the preview and ask them to confirm. Only after they say yes, call again
+    with the SAME arguments plus that confirm_token - a token issued in the
+    current turn is refused, so the two calls cannot be chained inside one answer.
 
     Same viz_type/metrics semantics as create_chart, including sorting (x_axis_sort,
     x_axis_sort_asc, order_desc), orientation ("vertical"/"horizontal"), color ("đỏ", "xanh",
-    "cam", "tím", "vàng", "#HEX"), subtitle (description), and style controls.
+    "cam", "tím", "vàng", "#HEX"), subtitle (description), and axis titles/labels (x_axis_title/x_axis_label, y_axis_title/y_axis_label).
     """
     chart_id = _parse_id(chart_id)
     sess = _superset_session()
     current = sess.get(f"{SUPERSET_URL}/api/v1/chart/{chart_id}", timeout=15)
     current.raise_for_status()
     current_result = current.json()["result"]
+    dataset_id = current_result.get("datasource_id")
+    effective_name = chart_name or current_result.get("slice_name", "")
     current_params = json.loads(current_result.get("params") or "{}")
     (
         cur_viz,
@@ -995,6 +1046,8 @@ def update_chart(
         cur_orientation,
         cur_color,
         cur_description,
+        cur_x_axis_title,
+        cur_y_axis_title,
     ) = _extract_chart_spec(current_params)
 
     effective_viz_type = viz_type if viz_type is not None else cur_viz
@@ -1004,6 +1057,9 @@ def update_chart(
             target_color_scheme = _resolve_color_scheme(color)
         if target_color_scheme is None:
             target_color_scheme = cur_color_scheme
+
+    target_x_title = x_axis_title or x_axis_label
+    target_y_title = y_axis_title or y_axis_label
 
     new_params = _build_chart_params(
         effective_viz_type,
@@ -1020,7 +1076,48 @@ def update_chart(
         orientation if orientation is not None else cur_orientation,
         color if color is not None else cur_color,
         description if description is not None else cur_description,
+        target_x_title if target_x_title is not None else cur_x_axis_title,
+        target_y_title if target_y_title is not None else cur_y_axis_title,
     )
+
+    if confirm_token is None:
+        return {
+            "updated": False,
+            "requires_confirmation": True,
+            "chart_id": chart_id,
+            "chart_name": effective_name,
+            "confirm_token": _issue_create_token(
+                "update_chart",
+                {
+                    "chart_id": chart_id,
+                    "chart_name": chart_name,
+                    "viz_type": viz_type,
+                    "metrics": metrics,
+                    "groupby": groupby,
+                    "time_range": time_range,
+                    "row_limit": row_limit,
+                    "color_scheme": color_scheme,
+                    "show_legend": show_legend,
+                    "number_format": number_format,
+                    "x_axis_sort": x_axis_sort,
+                    "x_axis_sort_asc": x_axis_sort_asc,
+                    "order_desc": order_desc,
+                    "orientation": orientation,
+                    "color": color,
+                    "description": description,
+                    "x_axis_title": x_axis_title,
+                    "y_axis_title": y_axis_title,
+                },
+            ),
+            "next_step": (
+                "Show this preview to the user and ask them to confirm before the "
+                "chart is updated. Only call update_chart again, with confirm_token, "
+                "once they answer yes."
+            ),
+            **_explore_preview_url(sess, dataset_id, effective_name, new_params),
+        }
+
+    _consume_create_token(confirm_token, "update_chart")
 
     payload: dict[str, Any] = {
         "viz_type": effective_viz_type,
@@ -1064,7 +1161,7 @@ def update_chart(
                 logger.warning("Failed to sync dashboard label_colors: {}", e)
 
     _invalidate_sql_cache(f"get_chart_{chart_id}", f"chart_sql_{chart_id}", "list_charts")
-    return {"chart_id": chart_id, **_chart_urls(chart_id)}
+    return {"updated": True, "chart_id": chart_id, **_chart_urls(chart_id)}
 
 
 @mcp.tool()
@@ -1250,6 +1347,8 @@ def get_chart(chart_id: int | str) -> dict[str, Any]:
         orientation,
         color,
         description,
+        x_axis_title,
+        y_axis_title,
     ) = _extract_chart_spec(params)
     res = {
         "chart_id": chart_id,
@@ -1269,6 +1368,8 @@ def get_chart(chart_id: int | str) -> dict[str, Any]:
         "orientation": orientation,
         "color": color,
         "description": result.get("description") or description,
+        "x_axis_title": x_axis_title,
+        "y_axis_title": y_axis_title,
         "dashboards": [
             {"id": d.get("id"), "title": d.get("dashboard_title")}
             for d in (result.get("dashboards") or [])

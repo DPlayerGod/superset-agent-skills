@@ -47,9 +47,10 @@ Tên tool gọi LUÔN có tiền tố `mcp__superset-postgres__`.
   - `viz_type` cho biểu đồ cột/thanh LUÔN là `"echarts_timeseries_bar"` (TUYỆT ĐỐI KHÔNG dùng `"horizontal_bar"` vì sẽ gây lỗi).
   - Khi cần vẽ thanh ngang: truyền `orientation="horizontal"` (mặc định là `"vertical"`).
   - Khi cần sắp xếp trục X theo giá trị (ví dụ: xếp dự án theo FTE cao -> thấp): truyền `x_axis_sort="SUM(project_allocated_hc)"`, `x_axis_sort_asc=False`, `order_desc=True`.
-- **Đổi màu & Thêm Subtitle (Mô tả)**:
+- **Đổi màu, Subtitle (Mô tả) & Tiêu đề trục (Axis Titles)**:
   - Khi người dùng yêu cầu đổi màu (ví dụ: "đổi sang màu đỏ", "dùng màu xanh lá", "màu cam"): truyền `color="đỏ"` (hoặc `"xanh dương"`, `"xanh lá"`, `"cam"`, `"tím"`, `"vàng"`, `"hồng"`, `"xám"` hoặc mã hex `#E74C3C`).
-  - Khi người dùng yêu cầu thêm phụ đề / mô tả / ghi chú: truyền `description="Nội dung phụ đề"`.
+  - Khi người dùng yêu cầu thêm phụ đề / mô tả / ghi chú: truyền `description="Nội dung phụ đề"`. (Với Big Number, phụ đề này hiển thị trực tiếp dưới số lớn. Với biểu đồ cột/thanh, nó hiển thị qua icon `ⓘ`).
+  - Khi người dùng yêu cầu thêm phụ đề/chú thích cho trục X hoặc trục Y: truyền `x_axis_title="Tên trục X"` và `y_axis_title="Tên trục Y"`.
 - **Xử lý phòng/dự án không tồn tại**: Nếu query theo `organization_name`, `project_name` hoặc `employee_level` trả về kết quả rỗng, chạy `SELECT DISTINCT <cột> FROM fact_employee_allocation WHERE current_row_indicator = 'Y'` để kiểm tra danh sách thực tế trước khi báo không có dữ liệu.
 
 # Quy tắc Tạo Chart vs Hỏi Truy Vấn Thông Thường
