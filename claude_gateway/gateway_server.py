@@ -170,13 +170,33 @@ _CHART_CREATION_MCP_TOOLS = {
 def _is_chart_requested(question: str) -> bool:
     if not question:
         return False
-    q = question.lower()
-    keywords = [
-        "vẽ", "tạo chart", "tạo biểu đồ", "vẽ biểu đồ", "vẽ đồ thị",
-        "tạo dashboard", "make a chart", "create chart", "visualize", "plot",
-        "tạo đồ thị", "vẽ chart", "vẽ dashboard"
+    q = question.lower().strip()
+
+    # 1. Explicit chart creation/modification signals:
+    # Requires AT LEAST ONE chart domain noun AND AT LEAST ONE creation or chart-type verb
+    chart_nouns = [
+        "chart", "biểu đồ", "đồ thị", "dashboard", "dataset", "visualize", "plot", "vẽ", "table"
     ]
-    return any(kw in q for kw in keywords)
+    action_or_type_verbs = [
+        "tạo", "vẽ", "thêm", "gắn", "create", "make", "show", "gen", "generate",
+        "pie", "bar", "line", "donut", "table", "area", "heatmap", "big_number", "treemap"
+    ]
+    has_chart_noun = any(noun in q for noun in chart_nouns)
+    has_action_or_type = any(verb in q for verb in action_or_type_verbs)
+
+    if has_chart_noun and has_action_or_type:
+        return True
+
+    # 2. Confirmation turn: Only match short answers (<= 6 words) not ending with '?'
+    # Use split() instead of \w+ regex so Vietnamese accented characters (có, đồng ý, được) are preserved!
+    is_short_reply = len(q.split()) <= 6 and not q.endswith("?")
+    words = {w.strip(".,!?\"'") for w in q.split()}
+    confirm_tokens = {"có", "ok", "yes", "lưu", "save", "confirm", "được", "đồng", "ý", "co"}
+
+    if is_short_reply and bool(words.intersection(confirm_tokens)):
+        return True
+
+    return False
 
 
 def _get_allowed_tools(question: str = "") -> str:
