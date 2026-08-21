@@ -47,7 +47,16 @@ from loguru import logger
 from render_config import render
 
 logger.remove()
-logger.add(sys.stderr, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} {level} {message}")
+logger.add(
+    sys.stderr,
+    level="INFO",
+    colorize=True,
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <7}</level> | "
+        "<level>{message}</level>"
+    ),
+)
 
 PORT = int(os.getenv("CLAUDE_GATEWAY_PORT", "8090"))
 MCP_CONFIG_PATH = "/app/mcp_servers.json"
@@ -102,6 +111,7 @@ _MCP_TOOLS = (
     "update_chart",
     "create_dashboard",
     "add_charts_to_dashboard",
+    "update_dashboard",
     "health_check",
     "get_instance_info",
     "list_charts",
@@ -117,48 +127,6 @@ _MCP_TOOLS = (
 )
 
 
-
-# Explicitly deny Claude's built-in tools so the gateway can only ever reach
-# Postgres/Superset through the vetted MCP tools, never Bash/file edits.
-#
-# The MCP tool set is the same for both baseline and skills: every tool in
-# _MCP_TOOLS, minus the chart-creation tools gated by _get_allowed_tools below. The
-# variant difference is in --disallowedTools: baseline denies Skill tool, skills
-# allows it (so Claude can load marketplace skills as supplements). This is only an
-# auto-approval list, not a boundary: under
-# --permission-mode dontAsk a built-in tool that appears in neither list still
-# runs. Observed on 2026-08-14 - turns called TaskCreate/TaskUpdate despite them
-# being absent from the allowed-tools list. So every built-in the gateway does not
-# want has to be named here, and a name only denies itself: denying "Task" left TaskCreate,
-# TaskUpdate and the rest of the family reachable. Ordered by what they would cost
-# if a Superset user talked the model into one:
-#   Monitor/Workflow/PowerShell - take a shell command, i.e. the Bash ban's back door
-#   RemoteTrigger/Agent       - run work elsewhere, or spawn a whole second agent
-#   Cron*/ScheduleWakeup      - schedule work that outlives this request
-#   SendMessage/PushNotification/DesignSync/Artifact - send data outbound
-#   EnterWorktree/ExitWorktree - touch the filesystem
-#   AskUserQuestion           - blocks forever: nothing can answer it headless
-#   Task*/*PlanMode/ToolSearch - harmless, but each one burns a tool call per turn
-#   *McpResource*             - read MCP resources the 7 vetted tools do not expose
-#
-# The list is deliberately over-broad: a name that does not exist in the installed
-# CLI costs nothing, while a missing one costs seconds. Both ToolSearch (4.2s) and
-# RemoteTrigger (3.0-5.6s) were caught this way on 2026-08-18, each spending a whole
-# round-trip before the first SQL statement ran.
-_BASE_DISALLOWED_TOOLS = {
-    "Bash", "PowerShell", "Read", "Write", "Edit", "Glob", "Grep",
-    "WebFetch", "WebSearch", "NotebookEdit", "Task", "Agent",
-    "Monitor", "Workflow", "RemoteTrigger",
-    "Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-    "CronCreate", "CronDelete", "CronList", "ScheduleWakeup",
-    "SendMessage", "PushNotification", "DesignSync",
-    "EnterWorktree", "ExitWorktree",
-    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
-    "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
-    "ToolSearch",
-}
-
-
 _CHART_CREATION_MCP_TOOLS = {
     f"mcp__{MCP_SERVER_NAME}__create_chart",
     f"mcp__{MCP_SERVER_NAME}__create_dataset",
@@ -172,26 +140,24 @@ def _is_chart_requested(question: str) -> bool:
         return False
     q = question.lower().strip()
 
-    # 1. Explicit chart creation/modification signals:
-    # Requires AT LEAST ONE chart domain noun AND AT LEAST ONE creation or chart-type verb
-    chart_nouns = [
-        "chart", "biểu đồ", "đồ thị", "dashboard", "dataset", "visualize", "plot", "vẽ", "table"
+    # 1. Explicit chart creation/modification/action signals
+    chart_signals = [
+        "chart", "biểu đồ", "đồ thị", "dashboard", "dataset", "visualize", "plot", "vẽ", "table",
+        "tạo", "create", "make", "gen", "generate", "thêm", "gắn", "pie", "bar", "line",
+        "donut", "heatmap", "big_number", "treemap", "bảng"
     ]
-    action_or_type_verbs = [
-        "tạo", "vẽ", "thêm", "gắn", "create", "make", "show", "gen", "generate",
-        "pie", "bar", "line", "donut", "table", "area", "heatmap", "big_number", "treemap"
-    ]
-    has_chart_noun = any(noun in q for noun in chart_nouns)
-    has_action_or_type = any(verb in q for verb in action_or_type_verbs)
-
-    if has_chart_noun and has_action_or_type:
+    if any(sig in q for sig in chart_signals):
         return True
 
-    # 2. Confirmation turn: Only match short answers (<= 6 words) not ending with '?'
-    # Use split() instead of \w+ regex so Vietnamese accented characters (có, đồng ý, được) are preserved!
-    is_short_reply = len(q.split()) <= 6 and not q.endswith("?")
-    words = {w.strip(".,!?\"'") for w in q.split()}
-    confirm_tokens = {"có", "ok", "yes", "lưu", "save", "confirm", "được", "đồng", "ý", "co"}
+    # 2. Confirmation turn: Any short affirmative/follow-up response (<= 8 words)
+    is_short_reply = len(q.split()) <= 8 and not q.endswith("?")
+    words = {w.strip(".,!?\"'").lower() for w in q.split()}
+    confirm_tokens = {
+        "có", "co", "ok", "yes", "y", "lưu", "luu", "save", "confirm", "được", "duoc",
+        "đồng", "dong", "ý", "y", "phải", "phai", "đúng", "dung", "chuẩn", "chuan",
+        "chính", "xác", "ừ", "u", "uh", "dạ", "da", "tiếp", "tiep", "tục", "tuc",
+        "làm", "lam", "tạo", "tao", "vẽ", "ve", "lại", "lai", "rồi", "roi"
+    }
 
     if is_short_reply and bool(words.intersection(confirm_tokens)):
         return True
@@ -217,6 +183,20 @@ def _get_allowed_tools(question: str = "") -> str:
         chart_tool_names = {name.rsplit("__", 1)[-1] for name in _CHART_CREATION_MCP_TOOLS}
         tools = tuple(t for t in tools if t not in chart_tool_names)
     return ",".join(f"mcp__{MCP_SERVER_NAME}__{tool}" for tool in tools)
+
+
+_BASE_DISALLOWED_TOOLS = {
+    "Bash", "PowerShell", "Read", "Write", "Edit", "Glob", "Grep",
+    "WebFetch", "WebSearch", "NotebookEdit", "Task", "Agent",
+    "Monitor", "Workflow", "RemoteTrigger",
+    "Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+    "CronCreate", "CronDelete", "CronList", "ScheduleWakeup",
+    "SendMessage", "PushNotification", "DesignSync",
+    "EnterWorktree", "ExitWorktree",
+    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
+    "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
+    "ToolSearch",
+}
 
 
 def _get_disallowed_tools(variant: str, question: str = "") -> str:
@@ -321,28 +301,46 @@ def _log_event(event: dict[str, Any]) -> None:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use":
-                logger.info("tool_use: {}({})", block.get("name"), json.dumps(block.get("input", {}))[:300])
+                tool_name = block.get("name")
+                tool_input = json.dumps(block.get("input", {}), ensure_ascii=False)[:300]
+                try:
+                    logger.opt(colors=True).info("<yellow>[TOOL USE]</yellow> <cyan><b>{}</b></cyan>({})", tool_name, tool_input)
+                except Exception:
+                    logger.info("tool_use: {}({})", tool_name, tool_input)
             elif block.get("type") == "tool_result":
                 content_str = str(block.get("content"))
+                is_err = block.get("is_error") or "error" in content_str.lower()
                 is_cached = bool(re.search(r"cached[\"'\\]*\s*:\s*(true|1)", content_str, re.IGNORECASE))
-                tag = "RAM CACHE HIT (0.1ms)" if is_cached else "FRESH DB QUERY"
-                logger.info("tool_result [{}]: {}", tag, content_str[:300])
+                try:
+                    if is_err and not is_cached:
+                        logger.opt(colors=True).error("<red><b>[TOOL RESULT - ERROR]</b></red> <red>{}</red>", content_str[:300])
+                    elif is_cached:
+                        logger.opt(colors=True).info("<magenta>[TOOL RESULT - CACHE HIT (0.1ms)]</magenta> {}", content_str[:300])
+                    else:
+                        logger.opt(colors=True).info("<green>[TOOL RESULT - SUCCESS]</green> <blue>{}</blue>", content_str[:300])
+                except Exception:
+                    logger.info("tool_result: {}", content_str[:300])
     elif etype == "system" and event.get("subtype") == "init":
-        # The CLI's opening event is the only place that says which tools actually
-        # made it into the turn, and what it thinks of each MCP server. Without it a
-        # "No such tool available" is unattributable: a tool the server never
-        # advertised, one the CLI deferred behind ToolSearch (which this gateway
-        # denies, so a deferred tool is unreachable for good), and one whose server
-        # was still connecting all look identical from the transcript alone.
         tools = event.get("tools") or []
-        logger.info(
-            "init: mcp_servers={} tools={} mcp_tools={}",
-            event.get("mcp_servers"),
-            len(tools),
-            sorted(_short_tool_name(t) for t in tools if isinstance(t, str) and t.startswith("mcp__")),
-        )
+        try:
+            logger.opt(colors=True).info(
+                "<green>[INIT]</green> mcp_servers={} tools=<yellow>{}</yellow> mcp_tools={}",
+                event.get("mcp_servers"),
+                len(tools),
+                sorted(_short_tool_name(t) for t in tools if isinstance(t, str) and t.startswith("mcp__")),
+            )
+        except Exception:
+            logger.info("init: tools={}", len(tools))
     elif etype == "result":
-        logger.info("result: is_error={} cost={}", event.get("is_error"), event.get("total_cost_usd"))
+        is_err = event.get("is_error")
+        cost = event.get("total_cost_usd")
+        try:
+            if is_err:
+                logger.opt(colors=True).error("<red><b>[TURN FAILED]</b></red> status=<red>ERROR</red> cost=<yellow>${:.5f}</yellow>", float(cost or 0))
+            else:
+                logger.opt(colors=True).info("<green><b>[TURN COMPLETED]</b></green> status=<green>SUCCESS</green> cost=<yellow>${:.5f}</yellow>", float(cost or 0))
+        except Exception:
+            logger.info("result: is_error={} cost={}", is_err, cost)
 
 
 def _short_tool_name(name: str) -> str:
@@ -409,9 +407,17 @@ def _stream_claude(
 ) -> Iterator[dict[str, Any]]:
     """Runs one headless Claude turn, yielding progress as the CLI produces it."""
     argv = _build_argv(prompt, session_id, resume, variant, question=question)
-    logger.info(
-        "exec claude ({}, session={}, variant={})", "resume" if resume else "new", session_id, variant
-    )
+    try:
+        logger.opt(colors=True).info(
+            "<cyan>[EXEC CLAUDE]</cyan> mode=<yellow>{}</yellow>, session=<white>{}</white>, variant=<blue>{}</blue>",
+            "resume" if resume else "new",
+            session_id,
+            variant,
+        )
+    except Exception:
+        logger.info(
+            "exec claude ({}, session={}, variant={})", "resume" if resume else "new", session_id, variant
+        )
 
     started_at = time.monotonic()
     # start_new_session puts the CLI and everything it spawns (MCP servers, helper
@@ -720,15 +726,18 @@ def _start_mcp_sidecar() -> subprocess.Popen | None:
     }
     proc = subprocess.Popen([sys.executable, "-u", MCP_SERVER_SCRIPT], env=env, cwd="/app")
     if _wait_for_port(MCP_HTTP_HOST, MCP_HTTP_PORT, MCP_STARTUP_TIMEOUT):
-        logger.info("mcp sidecar ready on {}:{} (pid {})", MCP_HTTP_HOST, MCP_HTTP_PORT, proc.pid)
+        try:
+            logger.opt(colors=True).info("<green>[MCP SERVER READY]</green> host=<cyan>{}</cyan>, port=<yellow>{}</yellow>, pid=<magenta>{}</magenta>", MCP_HTTP_HOST, MCP_HTTP_PORT, proc.pid)
+        except Exception:
+            logger.info("mcp sidecar ready on {}:{} (pid {})", MCP_HTTP_HOST, MCP_HTTP_PORT, proc.pid)
     else:
-        # Not fatal on its own: the CLI reports the server as failed in its `init`
-        # event, which _log_event now prints, and that is a far more useful thing to
-        # see than a gateway that refused to start.
-        logger.error(
-            "mcp sidecar did not accept connections within {}s - turns will start with no MCP tools",
-            MCP_STARTUP_TIMEOUT,
-        )
+        try:
+            logger.opt(colors=True).error(
+                "<red><b>[MCP SERVER FAILED]</b></red> did not accept connections within {}s - turns will start with no MCP tools",
+                MCP_STARTUP_TIMEOUT,
+            )
+        except Exception:
+            logger.error("mcp sidecar did not accept connections within {}s", MCP_STARTUP_TIMEOUT)
     return proc
 
 
@@ -740,7 +749,10 @@ def _supervise_mcp_sidecar(proc: subprocess.Popen) -> None:
     """
     while True:
         proc.wait()
-        logger.error("mcp sidecar exited with code {}; restarting", proc.returncode)
+        try:
+            logger.opt(colors=True).error("<red><b>[MCP SERVER CRASHED]</b></red> exited with code <yellow>{}</yellow>; restarting", proc.returncode)
+        except Exception:
+            logger.error("mcp sidecar exited with code {}; restarting", proc.returncode)
         time.sleep(1)
         proc = _start_mcp_sidecar()
         if proc is None:
@@ -752,5 +764,8 @@ if __name__ == "__main__":
     mcp_proc = _start_mcp_sidecar()
     if mcp_proc is not None:
         threading.Thread(target=_supervise_mcp_sidecar, args=(mcp_proc,), daemon=True).start()
-    logger.info("claude_gateway listening on :{}", PORT)
+    try:
+        logger.opt(colors=True).info("<green><b>[GATEWAY SERVER STARTED]</b></green> listening on port <yellow>:{}</yellow>", PORT)
+    except Exception:
+        logger.info("claude_gateway listening on :{}", PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), GatewayHandler).serve_forever()

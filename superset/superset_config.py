@@ -8,6 +8,12 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from socket import timeout as SocketTimeout
 
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()
+except Exception:
+    pass
+
 from flask import (
     Blueprint,
     Response,

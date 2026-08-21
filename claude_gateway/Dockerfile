@@ -12,6 +12,8 @@ COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 COPY mcp_server.py /app/mcp_server.py
+# The MCP tools themselves - mcp_server.py is only the entry point.
+COPY superset_mcp /app/superset_mcp
 COPY docs/mock_data_docs.md /app/mock_data_docs.md
 COPY claude_gateway/gateway_server.py /app/gateway_server.py
 COPY claude_gateway/benchmark.py /app/benchmark.py

@@ -24,6 +24,8 @@ services:
       - "8088:8088"
     depends_on:
       - postgres
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       SUPERSET_SECRET_KEY: "super_secret_key_987654321_abc"
       AGENT_GATEWAY_URL: http://claude_gateway:8090
@@ -56,6 +58,8 @@ services:
     depends_on:
       - postgres
       - superset
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     working_dir: /app
     command: python3 gateway_server.py
     # Superset reaches the gateway in-network at http://claude_gateway:8090; this
@@ -71,6 +75,7 @@ services:
       # Anthropic's own endpoint, not a custom API-key proxy.
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?Set CLAUDE_CODE_OAUTH_TOKEN in your shell or a .env file before running docker compose up. Generate it with `claude setup-token`.}
       DATABASE_URL: postgresql://super_user:super_pass@postgres:5432/super_db
+      MARIADB_URL: mysql+pymysql://sales_user:sales_pass@host.docker.internal:3306/sales_db
       MCP_MAX_ROWS: 500
       SUPERSET_URL: http://superset:8088
       # Browser-facing base URL. SUPERSET_URL above is the in-network hostname used
