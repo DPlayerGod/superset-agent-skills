@@ -105,6 +105,7 @@ _MCP_TOOLS = (
     "list_datasets",
     "describe_table",
     "execute_sql",
+    "run_sql_readonly",
     "get_chart",
     "create_dataset",
     "create_chart",
@@ -309,7 +310,13 @@ def _log_event(event: dict[str, Any]) -> None:
                     logger.info("tool_use: {}({})", tool_name, tool_input)
             elif block.get("type") == "tool_result":
                 content_str = str(block.get("content"))
-                is_err = block.get("is_error") or "error" in content_str.lower()
+                is_err = (
+                    block.get("is_error")
+                    or bool(re.search(r'["\']success["\']\s*:\s*false', content_str, re.I))
+                    or "<tool_use_error>" in content_str
+                    or "error executing tool" in content_str.lower()
+                    or "permission to use" in content_str.lower()
+                )
                 is_cached = bool(re.search(r"cached[\"'\\]*\s*:\s*(true|1)", content_str, re.IGNORECASE))
                 try:
                     if is_err and not is_cached:

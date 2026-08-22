@@ -159,13 +159,18 @@ def _parse_sql_to_chart_data_query(sql: str) -> dict[str, Any]:
     """Parses a SELECT SQL query into structured components for Superset /api/v1/chart/data."""
     clean_sql = sql.strip().rstrip(";")
 
+    # If it's a CTE like WITH ... AS ( SELECT ... FROM ... ) SELECT ...
+    # Extract the base query targeting the physical table
+    cte_inner = re.search(r"\bas\s*\(\s*(select\s+.*?\s+from\s+[\w\.\"]+.*?)\)", clean_sql, re.IGNORECASE | re.DOTALL)
+    target_sql = cte_inner.group(1).strip() if cte_inner else clean_sql
+
     # Extract LIMIT
     limit_match = re.search(r"\blimit\s+(\d+)", clean_sql, re.IGNORECASE)
     limit = int(limit_match.group(1)) if limit_match else 200
 
-    # Extract ORDER BY
+    # Extract ORDER BY (from main query or inner)
     orderby_list: list[list[Any]] = []
-    order_match = re.search(r"\border\s+by\s+(.*?)(?:\blimit\b|$)", clean_sql, re.IGNORECASE | re.DOTALL)
+    order_match = re.search(r"\border\s+by\s+([^()]+?)(?:\blimit\b|$|\))", clean_sql, re.IGNORECASE)
     if order_match:
         raw_order = order_match.group(1).strip()
         for item in raw_order.split(","):
@@ -181,16 +186,16 @@ def _parse_sql_to_chart_data_query(sql: str) -> dict[str, Any]:
 
     # Extract GROUP BY
     groupby_list: list[str] = []
-    group_match = re.search(r"\bgroup\s+by\s+(.*?)(?:\border\s+by\b|\blimit\b|$)", clean_sql, re.IGNORECASE | re.DOTALL)
+    group_match = re.search(r"\bgroup\s+by\s+([^()]+?)(?:\border\s+by\b|\blimit\b|$|\))", target_sql, re.IGNORECASE)
     if group_match:
         raw_group = group_match.group(1).strip()
         for item in raw_group.split(","):
             item_clean = item.strip()
-            if item_clean:
+            if item_clean and not any(kw in item_clean.upper() for kw in ("SELECT", "FROM", "WHERE")):
                 groupby_list.append(item_clean)
 
     # Extract SELECT columns and metrics
-    select_match = re.search(r"^\s*select\s+(.*?)\s+from\b", clean_sql, re.IGNORECASE | re.DOTALL)
+    select_match = re.search(r"\bselect\s+(.*?)\s+from\b", target_sql, re.IGNORECASE | re.DOTALL)
     columns_list: list[str] = []
     metrics_list: list[Any] = []
     if select_match:
@@ -203,7 +208,7 @@ def _parse_sql_to_chart_data_query(sql: str) -> dict[str, Any]:
             if any(expr_no_alias.upper().startswith(fn) for fn in ("SUM(", "COUNT(", "AVG(", "MIN(", "MAX(")):
                 metrics_list.append({"expressionType": "SQL", "sqlExpression": expr_no_alias, "label": expr_no_alias})
             else:
-                if expr_no_alias != "*":
+                if expr_no_alias != "*" and not any(kw in expr_no_alias.upper() for kw in ("SELECT", "OVER", "LAG(")):
                     columns_list.append(expr_no_alias)
 
     return {
